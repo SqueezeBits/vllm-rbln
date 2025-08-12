@@ -20,8 +20,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.models import (deepseek_v2, llama, qwen2, qwen2_moe,
-                                        qwen3_moe, utils)
+from vllm.model_executor.models import (deepseek_v2, exaone, llama, qwen2,
+                                        qwen2_moe, qwen3_moe, utils)
 
 logger = init_logger(__name__)
 
@@ -499,8 +499,85 @@ def load_deepseek_v2_weights(
     return loaded_params
 
 
+def load_exaone_weights(
+        self: exaone.ExaoneModel,
+        weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        (".gate_up_proj", ".c_fc_0", 0),
+        (".gate_up_proj", ".c_fc_1", 1),
+    ]
+    params_dict = dict(self.named_parameters())
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        """
+        [RBLN] Skips loading of layers greater than `num_hidden_layers`.
+        This must be modified to more graceful code in the future.
+        """
+        if name.startswith("h."):
+            layer_idx = int(name.split(".")[1])
+            if layer_idx >= self.config.num_hidden_layers:
+                continue
+        if "rotary_emb.inv_freq" in name:
+            continue
+        if ("rotary_emb.cos_cached" in name
+                or "rotary_emb.sin_cached" in name):
+            # Models trained using ColossalAI may include these tensors in
+            # the checkpoint. Skip them.
+            continue
+        if (self.quant_config is not None
+                and (scale_name := self.quant_config.get_cache_scale(name))):
+            # Loading kv cache quantization scales
+            param = params_dict[scale_name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            loaded_weight = (loaded_weight
+                             if loaded_weight.dim() == 0 else loaded_weight[0])
+            weight_loader(param, loaded_weight)
+            loaded_params.add(scale_name)
+            continue
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            name = name.replace(weight_name, param_name)
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            if utils.is_pp_missing_parameter(name, self):
+                continue
+
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+
+            break
+        else:
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            # Remapping the name of FP8 kv-scale.
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+
+            if utils.is_pp_missing_parameter(name, self):
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+        loaded_params.add(name)
+    return loaded_params
+
+
 llama.LlamaModel.load_weights = load_llama_weights
 qwen2.Qwen2Model.load_weights = load_qwen2_weights
 qwen2_moe.Qwen2MoeModel.load_weights = load_qwen2moe_weights
 qwen3_moe.Qwen3MoeModel.load_weights = load_qwen3moe_weights
 deepseek_v2.DeepseekV2ForCausalLM.load_weights = load_deepseek_v2_weights
+exaone.ExaoneModel.load_weights = load_exaone_weights
