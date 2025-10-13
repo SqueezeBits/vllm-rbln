@@ -178,8 +178,8 @@ class RblnPlatform(Platform):
 
         assert (vllm_config.lora_config
                 is None), "LoRA is not supported for RBLN backend."
-        assert (not vllm_config.speculative_config
-                ), "Speculative decoding not yet supported for RBLN backend."
+        # assert (not vllm_config.speculative_config
+        #         ), "Speculative decoding not yet supported for RBLN backend."
 
         cache_config = vllm_config.cache_config
         if cache_config:

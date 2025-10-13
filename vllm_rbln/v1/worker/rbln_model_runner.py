@@ -46,9 +46,14 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -87,7 +92,7 @@ class RBLNModelRunner:
         self.observability_config = vllm_config.observability_config
 
         assert str(device) in ["cpu", "rbln"]
-        assert self.speculative_config is None, "spec decode is not supported."
+        # assert self.speculative_config is None, "spec decode is not supported."
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -637,18 +642,18 @@ class RBLNModelRunner:
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
             # requests have draft tokens.
-            # num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
-            # for (
-            #     req_id,
-            #     draft_token_ids,
-            # ) in scheduler_output.scheduled_spec_decode_tokens.items():
-            #     req_idx = self.input_batch.req_id_to_index[req_id]
-            #     num_draft_tokens[req_idx] = len(draft_token_ids)
+            num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+            for (
+                req_id,
+                draft_token_ids,
+            ) in scheduler_output.scheduled_spec_decode_tokens.items():
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_draft_tokens[req_idx] = len(draft_token_ids)
 
-            # spec_decode_metadata = self._calc_spec_decode_metadata(
-            #     num_draft_tokens, cu_num_tokens
-            # )
-            # logits_indices = spec_decode_metadata.logits_indices
+            spec_decode_metadata = self._calc_spec_decode_metadata(
+                num_draft_tokens, cu_num_tokens
+            )
+            logits_indices = spec_decode_metadata.logits_indices
 
         # Hot-Swap lora model
         # if self.lora_config:
@@ -667,6 +672,66 @@ class RBLNModelRunner:
         logger.info("attn_metadata: %s", next(iter(attn_metadata.items())))
         logger.info("logits_indices: %s", logits_indices)
         return attn_metadata, logits_indices, spec_decode_metadata
+
+    def _calc_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+    ) -> SpecDecodeMetadata:
+        # Inputs:
+        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+        # num_draft_tokens:         [  3,   0,   2,   0,   1]
+        # Outputs:
+        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
+        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
+        #                            206, 207, 208]
+        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
+        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
+
+        # Compute the logits indices.
+        # [4, 1, 3, 1, 2]
+        num_sampled_tokens = num_draft_tokens + 1
+
+        # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
+        # arange: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
+        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(num_sampled_tokens, cumsum_dtype=np.int32)
+        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
+        logits_indices = np.repeat(cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens)
+        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
+        logits_indices += arange
+
+        # Compute the bonus logits indices.
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(num_draft_tokens, cumsum_dtype=np.int32)
+        # [0, 0, 0, 5, 5, 9]
+        target_logits_indices = np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens)
+        # [0, 1, 2, 5, 6, 9]
+        target_logits_indices += arange
+
+        # TODO: Optimize the CPU -> GPU copy.
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(self.device, non_blocking=True)
+        logits_indices = torch.from_numpy(logits_indices).to(self.device, non_blocking=True)
+        target_logits_indices = torch.from_numpy(target_logits_indices).to(self.device, non_blocking=True)
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(self.device, non_blocking=True)
+
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        draft_token_ids = self.input_ids[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        metadata = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
+        return metadata
 
     def _compile_model(self, model):
         options = {
@@ -756,6 +821,7 @@ class RBLNModelRunner:
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        breakpoint()
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -826,6 +892,7 @@ class RBLNModelRunner:
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
+        print(f"input_ids: {input_ids}")
         with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -869,8 +936,25 @@ class RBLNModelRunner:
                 )
             else:
                 # batch padding
+                # _positions = positions
+                # max_num_decode_tokens = max(scheduler_output.num_scheduled_tokens.values())
+                # input_ids = torch.zeros((self.input_batch.num_reqs, max_num_decode_tokens), dtype=torch.long)
+                # positions = torch.zeros((self.input_batch.num_reqs, max_num_decode_tokens), dtype=torch.long)
+                # _accumulated_num_tokens = 0
+                # for req_id in self.input_batch.req_ids:
+                #     _num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                #     req_idx = self.input_batch.req_id_to_index[req_id]
+                #     pos_idx = _positions[_accumulated_num_tokens]
+                #     input_ids[req_idx][:_num_scheduled_tokens] = self.input_batch.token_ids_cpu_tensor[req_idx][pos_idx:pos_idx+_num_scheduled_tokens]
+                #     positions[req_idx][:_num_scheduled_tokens] = _positions[_accumulated_num_tokens:_accumulated_num_tokens+_num_scheduled_tokens]
+                #     _accumulated_num_tokens += _num_scheduled_tokens
+
                 batch_padding_size = (self.max_num_seqs -
                                       self.input_batch.num_reqs)
+                input_ids = input_ids.to(self.device)
+                positions = positions.to(self.device)
+                input_ids = input_ids.view(self.input_batch.num_reqs, -1)
+                positions = positions.view(self.input_batch.num_reqs, -1)
                 input_ids = torch.cat([
                     input_ids,
                     torch.full((batch_padding_size, input_ids.shape[-1]),
@@ -1017,34 +1101,34 @@ class RBLNModelRunner:
         if not self.speculative_config:
             # Speculative decoding is not enabled.
             spec_token_ids = None
-        # elif self.speculative_config.method == "ngram":
-        #     assert isinstance(self.drafter, NgramProposer)
-        #     spec_token_ids = self.generate_draft_token_ids(
-        #         valid_sampled_token_ids, sampling_metadata
-        #     )
-        # elif self.speculative_config.method == "medusa":
-        #     assert isinstance(self.drafter, MedusaProposer)
-        #     if max_gen_len == 1:
-        #         hidden_states = sample_hidden_states
-        #     else:
-        #         indices = []
-        #         offset = 0
-        #         for num_draft, tokens in zip(
-        #             spec_decode_metadata.num_draft_tokens,
-        #             valid_sampled_token_ids,
-        #         ):
-        #             indices.append(offset + len(tokens) - 1)
-        #             offset += num_draft + 1
+        elif self.speculative_config.method == "ngram":
+            assert isinstance(self.drafter, NgramProposer)
+            spec_token_ids = self.generate_draft_token_ids(
+                valid_sampled_token_ids, sampling_metadata
+            )
+        elif self.speculative_config.method == "medusa":
+            assert isinstance(self.drafter, MedusaProposer)
+            if max_gen_len == 1:
+                hidden_states = sample_hidden_states
+            else:
+                indices = []
+                offset = 0
+                for num_draft, tokens in zip(
+                    spec_decode_metadata.num_draft_tokens,
+                    valid_sampled_token_ids,
+                ):
+                    indices.append(offset + len(tokens) - 1)
+                    offset += num_draft + 1
 
-        #         indices = torch.tensor(
-        #             indices, device=sample_hidden_states.device
-        #         )
-        #         hidden_states = sample_hidden_states[indices]
+                indices = torch.tensor(
+                    indices, device=sample_hidden_states.device
+                )
+                hidden_states = sample_hidden_states[indices]
 
-        #     spec_token_ids = self.drafter.propose(
-        #         target_hidden_states=hidden_states,
-        #         sampling_metadata=sampling_metadata,
-        #     )
+            spec_token_ids = self.drafter.propose(
+                target_hidden_states=hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
         # elif self.speculative_config.use_eagle():
         #     assert isinstance(self.drafter, EagleProposer)
         #     # TODO(woosuk): Refactor the loop.
@@ -1139,6 +1223,8 @@ class RBLNModelRunner:
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
 
+        print(f"spec_token_ids: {spec_token_ids}")
+        print(f"valid_sampled_token_ids: {valid_sampled_token_ids}")
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1195,6 +1281,43 @@ class RBLNModelRunner:
             return get_kv_transfer_group().get_finished(
                 scheduler_output.finished_req_ids)
         return None, None
+    
+    def generate_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+        sampling_metadata: SamplingMetadata,
+    ) -> list[list[int]]:
+        # TODO(woosuk): Optimize.
+        draft_token_ids: list[list[int]] = []
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+            if not num_sampled_ids:
+                # Skip speculative decoding.
+                draft_token_ids.append([])
+                continue
+
+            # Skip requests that require sampling parameters that are not
+            # supported with speculative decoding.
+            req_id = self.input_batch.req_ids[i]
+            if not is_spec_decode_supported(req_id, self.input_batch):
+                draft_token_ids.append([])
+                continue
+
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + num_sampled_ids
+            if end_idx >= self.max_model_len:
+                # Skip requests that have already reached the max model length.
+                draft_token_ids.append([])
+                continue
+
+            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+            drafter_output = self.drafter.propose(self.input_batch.token_ids_cpu[i, :end_idx])
+            if drafter_output is None or len(drafter_output) == 0:
+                draft_token_ids.append([])
+            else:
+                draft_token_ids.append(drafter_output.tolist())
+        return draft_token_ids
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -1223,13 +1346,19 @@ class RBLNModelRunner:
         #         self.lora_config,
         #         self.device,
         #     )
-        # if hasattr(self, "drafter"):
-        #     logger.info("Loading drafter model...")
-        #     self.drafter.load_model(self.model)
-        # if self.use_aux_hidden_state_outputs:
-        #     self.model.set_aux_hidden_state_layers(
-        #         self.model.get_eagle3_aux_hidden_state_layers()
-        #     )
+        self.use_aux_hidden_state_outputs = False
+        if self.speculative_config and get_pp_group().is_last_rank:
+            if self.speculative_config.method == "ngram":
+                self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "medusa":
+                self.drafter = MedusaProposer(vllm_config=self.vllm_config, device=self.device)  # type: ignore
+            else:
+                raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
+            
+            self.drafter.load_model(self.model)
+            # temporary workaround to avoid error
+            self.drafter.model.to("rbln", dtype=torch.float)
+            self.rejection_sampler = RejectionSampler()
 
         prepare_communication_buffer_for_model(self.model)
 
