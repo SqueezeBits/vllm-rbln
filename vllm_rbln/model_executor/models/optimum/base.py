@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import PretrainedConfig
+from vllm.lora.layers import LoRAMapping
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.pooling_metadata import PoolingMetadata
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import BatchedTensorInputs
@@ -51,12 +53,14 @@ _RBLN_ENCODER_DECODER_MODELS: Dict[str, Tuple[str, str]] = {
 _RBLN_MULTIMODAL_MODELS = {
     "LlavaNextForConditionalGeneration":
     ("llava_next", "RBLNLlavaNextForConditionalGeneration"),
+    "Qwen2VLForConditionalGeneration":
+    ("qwen2_vl", "RBLNQwen2VLForConditionalGeneration"),
     "Qwen2_5_VLForConditionalGeneration":
     ("qwen2_5_vl", "RBLNQwen2_5_VLForConditionalGeneration"),
     "Idefics3ForConditionalGeneration":
     ("idefics3", "RBLNIdefics3ForConditionalGeneration"),
-    "Blip2ForConditionalGeneration":
-    ("blip2", "RBLNBlip2ForConditionalGeneration"),
+    "Blip2ForConditionalGeneration": ("blip2",
+                                      "RBLNBlip2ForConditionalGeneration"),
     "Gemma3ForConditionalGeneration": ("gemma3",
                                        "RBLNGemma3ForConditionalGeneration"),
     "WhisperForConditionalGeneration": ("whisper",
@@ -102,6 +106,8 @@ class ModelInputForRBLN(ModelRunnerInputBase):
     multi_modal_kwargs: Optional[BatchedTensorInputs] = None
     token_type_ids: Optional[torch.Tensor] = None
     pooling_metadata: Optional[PoolingMetadata] = None  # for V0
+    lora_requests: Optional[List[LoRARequest]] = None  # for V0
+    lora_mapping: Optional["LoRAMapping"] = None  # for V0
 
     def as_broadcastable_tensor_dict(
             self) -> Dict[str, Union[int, torch.Tensor]]:
