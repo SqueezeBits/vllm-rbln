@@ -86,7 +86,7 @@ class RBLNModelRunner:
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
 
-        assert device in [torch.device("cpu"), torch.device("rbln")]
+        assert str(device) in ["cpu", "rbln"]
         assert self.speculative_config is None, "spec decode is not supported."
 
         model_config = self.model_config
@@ -653,19 +653,19 @@ class RBLNModelRunner:
         # Hot-Swap lora model
         # if self.lora_config:
         #     self.set_active_loras(self.input_batch, num_scheduled_tokens)
-        logger.info("num_reqs: %s", num_reqs)
-        logger.info("token_indices: %s", token_indices)
-        logger.info("input_batch: %s", vars(self.input_batch))
-        logger.info(
+        logger.debug("num_reqs: %s", num_reqs)
+        logger.debug("token_indices: %s", token_indices)
+        logger.debug("input_batch: %s", vars(self.input_batch))
+        logger.debug(
             "input_ids: %s",
             self.input_ids[:scheduler_output.total_num_scheduled_tokens],
         )
-        logger.info(
+        logger.debug(
             "positions: %s",
             self.positions[:scheduler_output.total_num_scheduled_tokens],
         )
-        logger.info("attn_metadata: %s", next(iter(attn_metadata.items())))
-        logger.info("logits_indices: %s", logits_indices)
+        logger.debug("attn_metadata: %s", next(iter(attn_metadata.items())))
+        logger.debug("logits_indices: %s", logits_indices)
         return attn_metadata, logits_indices, spec_decode_metadata
 
     def _compile_model(self, model):
@@ -836,9 +836,6 @@ class RBLNModelRunner:
             if attn_metadata is not None:
                 for attn_metadatum in attn_metadata.values():
                     attn_metadatum.kv_caches = self.kv_caches
-            if not self.model_config.enforce_eager and envs.RBLN_COMPILE_MODEL:
-                for kv_cache in self.kv_caches:
-                    self.compile_context.mark_static_address(kv_cache)
 
             # FIXME(jiwoo.park) This is a temporary workaround;
             # we must resolve the batch dimension.
@@ -1576,6 +1573,11 @@ class RBLNModelRunner:
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        if not self.model_config.enforce_eager and envs.RBLN_COMPILE_MODEL:
+            for kv_cache in self.kv_caches:
+                self.compile_context.mark_static_address(kv_cache)
+
         return kv_caches
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
