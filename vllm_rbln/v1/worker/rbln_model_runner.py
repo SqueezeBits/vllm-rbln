@@ -54,6 +54,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import initialize_kv_cache_for_kv_sharing
 
 import vllm_rbln.rbln_envs as envs
@@ -69,7 +70,7 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
-class RBLNModelRunner:
+class RBLNModelRunner(LoRAModelRunnerMixin):
 
     def __init__(
         self,
@@ -654,8 +655,8 @@ class RBLNModelRunner:
             # logits_indices = spec_decode_metadata.logits_indices
 
         # Hot-Swap lora model
-        # if self.lora_config:
-        #     self.set_active_loras(self.input_batch, num_scheduled_tokens)
+        if self.lora_config:
+            self.set_active_loras(self.input_batch, num_scheduled_tokens)
         logger.debug("num_reqs: %s", num_reqs)
         logger.debug("token_indices: %s", token_indices)
         logger.debug("input_batch: %s", vars(self.input_batch))
@@ -1043,6 +1044,8 @@ class RBLNModelRunner:
                 logits = self.compute_logits(hidden_states, None)
                 logits = logits[logits_indices]
             logits = self.logits_processor._gather_logits(logits)
+            logits = logits[..., :self.logits_processor.
+                            org_vocab_size]  # remove paddings in vocab
             logits = logits.view(-1, logits.size(-1))
 
         if broadcast_pp_output:
@@ -1361,14 +1364,14 @@ class RBLNModelRunner:
             ).logits_processor
         else:
             self.logits_processor = self.model.logits_processor
-        # if self.lora_config:
-        #     self.model = self.load_lora_model(
-        #         self.model,
-        #         self.model_config,
-        #         self.scheduler_config,
-        #         self.lora_config,
-        #         self.device,
-        #     )
+        if self.lora_config:
+            self.model = self.load_lora_model(
+                self.model,
+                self.model_config,
+                self.scheduler_config,
+                self.lora_config,
+                self.device,
+            )
         # if hasattr(self, "drafter"):
         #     logger.info("Loading drafter model...")
         #     self.drafter.load_model(self.model)
