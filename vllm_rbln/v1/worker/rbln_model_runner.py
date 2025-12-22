@@ -1750,7 +1750,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
-            if max_gen_len == 1:
+            if max_gen_len <= 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
             else:
@@ -2053,18 +2053,27 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.apply_grammar_bitmask(scheduler_output, logits)
 
         with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(
-                padded_logits if self.use_rbln_sampler else logits,
-                spec_decode_metadata)
-            if self.use_rbln_sampler and not self.is_prefill:
-                sampler_output.sampled_token_ids = \
-                    sampler_output.sampled_token_ids[logits_indices]
-                if sampler_output.logprobs_tensors is not None:
-                    sampler_output.logprobs_tensors = \
-                        self.post_process_logprobs_tensors(
-                            sampler_output.logprobs_tensors,
-                            logits_indices.size(0)
-                        )
+            if logits.size(0) == 0:
+                # empty logits, return empty sampler output
+                sampler_output = SamplerOutput(
+                    sampled_token_ids=torch.empty([0, 1], dtype=torch.int32),
+                    logprobs_tensors=None,
+                )
+            else:
+                sampler_output = self._sample(
+                    padded_logits if self.use_rbln_sampler else logits,
+                    spec_decode_metadata)
+
+                # post process for padded decode sampler output
+                if self.use_rbln_sampler and not self.is_prefill:
+                    sampler_output.sampled_token_ids = \
+                        sampler_output.sampled_token_ids[logits_indices]
+                    if sampler_output.logprobs_tensors is not None:
+                        sampler_output.logprobs_tensors = \
+                            self.post_process_logprobs_tensors(
+                                sampler_output.logprobs_tensors,
+                                logits_indices.size(0)
+                            )
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
