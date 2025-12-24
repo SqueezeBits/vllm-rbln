@@ -2854,6 +2854,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.transfer_event.synchronize()
         return pinned.tolist()
 
+    def post_process_logprobs_tensors(self, logprobs_tensors: LogprobsTensors,
+                                      num_reqs: int) -> LogprobsTensors:
+        # NOTE(eunji.lee):
+        # This implementation is not efficient but kept for debugging purposes.
+        # TODO: Modify this code in the next version when the shape of
+        # logprobs_tensors changes.
+        dict = {}
+        for field_name in logprobs_tensors._fields:
+            tensor = getattr(logprobs_tensors, field_name)
+            dict[field_name] = tensor[:num_reqs]
+        return LogprobsTensors(**dict)
+
 
 def create_lora_mask(input_ids: torch.Tensor, lora_ids: list[int],
                      lora_index_to_id: list[int], max_loras: int,
