@@ -32,29 +32,45 @@ SQL_LORA_MODEL_ID = "Rustamshry/Llama3.2-SQL-1B"
 
 
 def create_test_prompts(
-        lora_path: str | None,
-        lora_id: int = -1
-) -> list[tuple[str, SamplingParams, LoRARequest | None]]:
-    if lora_path is None:
-        return [
-            ("A robot may not injure a human being",
-             SamplingParams(temperature=0.0, max_tokens=128), None),
-        ]
+    lora_path: str, ) -> list[tuple[str, SamplingParams, LoRARequest | None]]:
+    """Create a list of test prompts with their sampling parameters.
 
-    if "sql" in lora_path.lower():
-        return [
-            (
-                "[user] Write a SQL query to answer the question based on the table schema.\n\n context: CREATE TABLE table_name_74 (icao VARCHAR, airport VARCHAR)\n\n question: Name the ICAO for lilongwe international airport [/user] [assistant]",  # noqa
-                SamplingParams(
-                    max_tokens=128,
-                    stop_token_ids=[32003],
-                    temperature=0.0,
-                ),
-                LoRARequest("sql-lora", lora_id, lora_path),
-            ),
-        ]
-
-    raise NotImplementedError
+    2 requests for base model, 4 requests for the LoRA. We define 2
+    different LoRA adapters (using the same model for demo purposes).
+    Since we also set `max_loras=1`, the expectation is that the requests
+    with the second LoRA adapter will be run after all requests with the
+    first adapter have finished.
+    """
+    return [
+        (
+            "A robot may not injure a human being",
+            SamplingParams(temperature=0.0, logprobs=1, max_tokens=128),
+            None,
+        ),
+        (
+            "[user] Write a SQL query to answer the question based on the table schema.\n\n context: CREATE TABLE table_name_74 (icao VARCHAR, airport VARCHAR)\n\n question: Name the ICAO for lilongwe international airport [/user] [assistant]",  # noqa: E501
+            SamplingParams(temperature=0.0, logprobs=1, max_tokens=128),
+            LoRARequest("sql-lora", 1, lora_path),
+        ),
+        (
+            "To be or not to be,",
+            SamplingParams(temperature=0.8,
+                           top_k=5,
+                           presence_penalty=0.2,
+                           max_tokens=128),
+            None,
+        ),
+        (
+            "[user] Write a SQL query to answer the question based on the table schema.\n\n context: CREATE TABLE table_name_74 (icao VARCHAR, airport VARCHAR)\n\n question: Name the ICAO for lilongwe international airport [/user] [assistant]",  # noqa: E501
+            SamplingParams(temperature=0.0, logprobs=1, max_tokens=128),
+            None,
+        ),
+        (
+            "[user] Write a SQL query to answer the question based on the table schema.\n\n context: CREATE TABLE table_name_74 (icao VARCHAR, airport VARCHAR)\n\n question: Name the ICAO for lilongwe international airport [/user] [assistant]",  # noqa: E501
+            SamplingParams(temperature=0.0, logprobs=1, max_tokens=128),
+            LoRARequest("sql-lora2", 2, lora_path),
+        ),
+    ]
 
 
 def process_requests(
@@ -92,9 +108,9 @@ def initialize_engine() -> LLMEngine:
         max_num_batched_tokens=256,
         max_num_seqs=4,
         enable_lora=True,
-        max_loras=1,
+        max_loras=2,
         max_lora_rank=8,
-        max_cpu_loras=1,
+        max_cpu_loras=2,
         # cannot set float32 due to vLLM's pydantic restriction
         # lora_dtype="float32",
     )
@@ -106,6 +122,6 @@ if __name__ == "__main__":
     sql_lora_path = snapshot_download(repo_id=SQL_LORA_MODEL_ID)
 
     # Note: The order of prompts matters
-    prompts = create_test_prompts(sql_lora_path, 1) + create_test_prompts(None)
+    prompts = create_test_prompts(sql_lora_path)
 
     process_requests(engine, prompts)
