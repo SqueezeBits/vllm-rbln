@@ -35,7 +35,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
                                              get_tp_group)
-from vllm.forward_context import DPMetadata, set_forward_context
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
 from vllm.model_executor.models.interfaces import supports_transcription
@@ -64,10 +64,11 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, CrossAttentionSpec,
                                         UniformTypeKVCacheSpecs)
 # yapf: enable
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
-                             DraftTokenIds, KVConnectorOutput, LogprobsLists, LogprobsTensors,
-                             ModelRunnerOutput, SamplerOutput)
+                             DraftTokenIds, KVConnectorOutput, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput, SamplerOutput)
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -1267,7 +1268,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def get_dp_padding(self,
                        num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        # dp_rank = self.vllm_config.parallel_config.data_parallel_rank
 
         # For DP: Don't pad when setting enforce_eager.
         # This lets us set enforce_eager on the prefiller in a P/D setup and
@@ -1776,6 +1777,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 intermediate_tensors,
                 model_kwargs,
             ) = self._preprocess(scheduler_output, intermediate_tensors)
+
+        # Padding for speculative decoding
+        # in case of that all requests are not scheduled equally.
+        num_scheduled_tokens_per_req = torch.tensor([
+            scheduler_output.num_scheduled_tokens[i]
+            for i in self.input_batch.req_ids
+        ],
+                                                    device=input_ids.device,
+                                                    dtype=torch.int32)
+        max_num_scheduled_tokens = torch.max(num_scheduled_tokens_per_req)
+
+        if self.speculative_config is not None and not torch.all(
+                num_scheduled_tokens_per_req == max_num_scheduled_tokens):
+            input_ids = rbln_utils.pad_speculative_draft_tokens(
+                input_ids, num_scheduled_tokens_per_req)
+            positions = rbln_utils.pad_speculative_draft_tokens(
+                positions, num_scheduled_tokens_per_req)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
