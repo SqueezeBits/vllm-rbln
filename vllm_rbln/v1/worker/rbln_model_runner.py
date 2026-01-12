@@ -2151,7 +2151,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         effective_drafter_max_model_len = self.max_model_len
         if effective_drafter_max_model_len is None:
             effective_drafter_max_model_len = self.model_config.max_model_len
-        if ((spec_config := self.speculative_config) is not None
+        if (spec_config is not None
                 and spec_config.draft_model_config is not None
                 and spec_config.draft_model_config.max_model_len is not None):
             effective_drafter_max_model_len = \
@@ -2160,7 +2160,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
             <= effective_drafter_max_model_len)
         if use_padded_batch_for_eagle:
-            assert self.speculative_config is not None
+            assert spec_config is not None
             assert isinstance(self.drafter, EagleProposer)
             sampled_token_ids = sampler_output.sampled_token_ids
             if input_fits_in_drafter:
@@ -2289,7 +2289,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     "No spec decode metadata for medusa")
                 for num_draft, tokens in zip(
                         spec_decode_metadata.num_draft_tokens,
-                        sampled_token_ids):
+                        sampled_token_ids,
+                        strict=False):
                     indices.append(offset + len(tokens) - 1)
                     offset += num_draft + 1
                 indices = torch.tensor(indices, device=self.device)
@@ -2328,7 +2329,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
                     target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states],
+                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states],
                         dim=-1)
             else:
                 common_attn_metadata, token_indices_to_sample = (
@@ -2344,7 +2345,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
                     target_hidden_states = torch.cat(
-                        [h[:total_num_tokens] for h in aux_hidden_states],
+                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states],
                         dim=-1)
 
             if self.supports_mm_inputs:
@@ -2417,14 +2418,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds)
 
-            # TODO(RBLN): consider using aux_hidden_states
-            hidden_states = model_output
             logits = None
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
 
             if get_pp_group().is_last_rank \
                 and self.lora_config is None \
                 and (self.speculative_config is None \
-                     or self.speculative_config.method != "eagle") \
+                     or self.speculative_config.method \
+                        not in ("eagle", "eagle3")) \
                 and not self.is_pooling_model \
                 and self.logits_processor is not None:
 
@@ -2440,6 +2444,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits = logits.view(-1, logits.size(-1))
 
             # non last rank create intermediate tensors, bypass it
+            if self.use_aux_hidden_state_outputs:
+                return hidden_states, aux_hidden_states, logits
             return hidden_states, logits
 
         if self.lora_config:
@@ -3254,8 +3260,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def use_wrapped_compute_logits(self) -> bool:
         return not (self.lora_config is not None or
-                    ((spec_config := self.speculative_config) is not None
-                     and spec_config.method == "eagle"))
+                    (self.speculative_config is not None and
+                     self.speculative_config.method in ("eagle", "eagle3")))
 
 
 def create_lora_mask(
