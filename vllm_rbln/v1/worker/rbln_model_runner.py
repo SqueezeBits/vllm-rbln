@@ -37,15 +37,23 @@ from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
                                              get_tp_group)
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
-from vllm.model_executor.models.interfaces import supports_transcription
+from vllm.model_executor.models.interfaces import supports_transcription, SupportsMultiModal, SupportsMRoPE, supports_mrope
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (
+    BatchedTensorInputs,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
+from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import round_up
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
@@ -78,13 +86,17 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (AttentionGroup, MultiModalBudget,
                                   add_kv_sharing_layers_to_kv_cache_groups,
-                                  bind_kv_cache)
+                                  bind_kv_cache,
+                                  gather_mm_placeholders,
+                                  sanity_check_mm_encoder_outputs,
+                                  scatter_mm_placeholders)
 
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
@@ -165,7 +177,7 @@ class ExecuteModelState(NamedTuple):
     kv_connector_output: KVConnectorOutput | None
 
 
-class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin):
 
     def __init__(
         self,
@@ -201,6 +213,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.is_pooling_model = (model_config.runner_type == 'pooling')
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model)
+        # This will be overridden in load_model()
+        self.is_multimodal_pruning_enabled = False
 
         self.max_model_len = model_config.max_model_len
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -221,7 +235,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
-        assert not self.uses_mrope, "RBLN does not support M-RoPE."
 
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config)
@@ -364,6 +377,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                          dtype=torch.int32)
         self.num_accepted_tokens = self._make_buffer(self.max_num_reqs,
                                                      dtype=torch.int64)
+
+        # Only relevant for multimodal models
+        if self.supports_mm_inputs:
+            self.is_mm_embed = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1476,15 +1493,20 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if (self.supports_mm_inputs and get_pp_group().is_first_rank
                 and not self.model_config.is_encoder_decoder):
             # Run the multimodal encoder if any.
-            self._execute_mm_encoder(scheduler_output)
-            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+            with self.maybe_get_ec_connector_output(
+                scheduler_output,
+                encoder_cache=self.encoder_cache,
+            ) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.get_input_embeddings(
-                input_ids=self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds or None,
+            inputs_embeds_scheduled = self.model.embed_input_ids(
+                self.input_ids.gpu[:num_scheduled_tokens],
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm_embed,
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.
@@ -1896,20 +1918,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Padding for speculative decoding
         # in case of that all requests are not scheduled equally.
-        num_scheduled_tokens_per_req = torch.tensor([
-            scheduler_output.num_scheduled_tokens[i]
-            for i in self.input_batch.req_ids
-        ],
-                                                    device=input_ids.device,
-                                                    dtype=torch.int32)
-        max_num_scheduled_tokens = torch.max(num_scheduled_tokens_per_req)
+        # TODO: inputs_embeds is not padded.
+        if input_ids is not None:
+            num_scheduled_tokens_per_req = torch.tensor([
+                    scheduler_output.num_scheduled_tokens[i]
+                    for i in self.input_batch.req_ids
+                ],
+                device=input_ids.device,
+                dtype=torch.int32)
+            max_num_scheduled_tokens = torch.max(num_scheduled_tokens_per_req)
 
-        if self.speculative_config is not None and not torch.all(
-                num_scheduled_tokens_per_req == max_num_scheduled_tokens):
-            input_ids = rbln_utils.pad_speculative_draft_tokens(
-                input_ids, num_scheduled_tokens_per_req)
-            positions = rbln_utils.pad_speculative_draft_tokens(
-                positions, num_scheduled_tokens_per_req)
+            if self.speculative_config is not None and not torch.all(
+                    num_scheduled_tokens_per_req == max_num_scheduled_tokens):
+                input_ids = rbln_utils.pad_speculative_draft_tokens(
+                    input_ids, num_scheduled_tokens_per_req)
+                positions = rbln_utils.pad_speculative_draft_tokens(
+                    positions, num_scheduled_tokens_per_req)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -1927,8 +1951,15 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # FIXME(jiwoo.park) This is a temporary workaround;
             # we must resolve the batch dimension.
-            input_ids = input_ids.view(num_reqs, -1).to(torch.long)
-            positions = positions.view(num_reqs, -1)
+            num_reqs = self.input_batch.num_reqs
+            if self.uses_mrope:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}")
+                inputs_embeds = inputs_embeds.view(positions.shape[1], -1).to(self.dtype)
+            else:
+                input_ids = input_ids.view(num_reqs, -1).to(torch.long)
+                positions = positions.view(num_reqs, -1)
             is_prefills = self.is_prefills()
 
             token_indices = None
@@ -1946,15 +1977,24 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 prefill_size = (self.scheduler_config.max_num_batched_tokens
                                 if self.scheduler_config.enable_chunked_prefill
                                 else 1 << (math.ceil(math.log2(max_seq_len))))
-                input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
-                positions = rbln_utils.pad(positions, -1, prefill_size)
+                if input_ids is not None:
+                    input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
+                if inputs_embeds is not None:
+                    inputs_embeds = rbln_utils.pad(inputs_embeds, 0, prefill_size)
+                if positions is not None:
+                    positions = rbln_utils.pad(positions, -1, prefill_size)
             else:
                 batch_bucket_size = \
                     self.bucketing_manager.find_decode_batch_bucket(
                         self.input_batch.num_reqs)
                 # decode batch padding
-                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
-                positions = rbln_utils.pad(positions, -2, batch_bucket_size)
+                if input_ids is not None:
+                    input_ids = rbln_utils.pad(input_ids, 0, self.max_num_seqs)
+                if positions is not None:
+                    if self.uses_mrope:
+                        positions = rbln_utils.pad(positions, -1, self.max_num_seqs)
+                    else:
+                        positions = rbln_utils.pad(positions, -2, self.max_num_seqs)
 
             if self.lora_config is not None:
                 lora_ids = [
@@ -3282,6 +3322,354 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     (self.speculative_config is not None and
                      self.speculative_config.method in ("eagle", "eagle3")))
 
+    def _init_mrope_positions(self, req_state: CachedRequestState):
+        model = self.get_model()
+        assert supports_mrope(model), "M-RoPE support is not implemented."
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE requires prompt_token_ids to be available."
+        )
+        mrope_model = cast(SupportsMRoPE, model)
+
+        req_state.mrope_positions, req_state.mrope_position_delta = (
+            mrope_model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                req_state.mm_features,
+            )
+        )
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req.prompt_token_ids, req.prompt_embeds
+            )
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            assert num_scheduled_tokens == prompt_part_len + completion_part_len
+
+            if prompt_part_len > 0:
+                # prompt's mrope_positions are pre-computed
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + prompt_part_len
+                src_start = num_computed_tokens
+                src_end = num_computed_tokens + prompt_part_len
+
+                self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[
+                    :, src_start:src_end
+                ]
+                mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                # compute completion's mrope_positions on-the-fly
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + completion_part_len
+
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions.np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
+
+                mrope_pos_ptr += completion_part_len
+
+    def _extract_mm_kwargs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> BatchedTensorInputs:
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return {}
+
+        mm_kwargs = list[MultiModalKwargsItem]()
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is not None:
+                    mm_kwargs.append(feature.data)
+
+        # Input all modalities at once
+        model = cast(SupportsMultiModal, self.model)
+        mm_kwargs_combined: BatchedTensorInputs = {}
+        for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            merge_by_field_config=model.merge_by_field_config,
+            multimodal_cpu_fields=model.multimodal_cpu_fields,
+        ):
+            mm_kwargs_combined.update(mm_kwargs_group)
+
+        return mm_kwargs_combined
+
+    def _dummy_mm_kwargs(self, num_seqs: int) -> BatchedTensorInputs:
+        if not self.is_multimodal_raw_input_only_model:
+            return {}
+
+        mm_budget = self.mm_budget
+        assert mm_budget is not None
+
+        dummy_modality = mm_budget.get_modality_with_max_tokens()
+        return self._get_mm_dummy_batch(dummy_modality, num_seqs)
+
+    def _get_mm_dummy_batch(
+        self,
+        modality: str,
+        max_items_per_batch: int,
+    ) -> BatchedTensorInputs:
+        """Dummy data for profiling and precompiling multimodal models."""
+        assert self.mm_budget is not None
+
+        dummy_decoder_data = self.mm_registry.get_decoder_dummy_data(
+            model_config=self.model_config,
+            seq_len=self.max_model_len,
+            mm_counts={modality: 1},
+            cache=self.mm_budget.cache,
+        )
+        dummy_mm_data = dummy_decoder_data.multi_modal_data
+
+        # Result in the maximum GPU consumption of the model
+        dummy_mm_item = dummy_mm_data[modality][0]
+        dummy_mm_items = [dummy_mm_item] * max_items_per_batch
+
+        model = cast(SupportsMultiModal, self.model)
+        return next(
+            mm_kwargs_group
+            for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+                dummy_mm_items,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                merge_by_field_config=model.merge_by_field_config,
+                multimodal_cpu_fields=model.multimodal_cpu_fields,
+            )
+        )
+
+    def _batch_mm_kwargs_from_scheduler(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[list[MultiModalKwargsItem], list[tuple[str, PlaceholderRange]]]:
+        """Batch multimodal kwargs from scheduled encoder inputs.
+
+        Args:
+            scheduler_output: The scheduler output containing scheduled encoder
+                inputs.
+
+        Returns:
+            A tuple of (mm_kwargs, req_ids_pos) where:
+            - mm_kwargs: List of multimodal kwargs items to be batched
+            - mm_hashes_pos: List of (mm_hash, position_info) tuples
+        """
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return [], []
+        # Batch the multi-modal inputs.
+        mm_kwargs = list[MultiModalKwargsItem]()
+        # list of tuple (mm_hash, position_info)
+        mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                mm_hash = mm_feature.identifier
+                mm_kwargs.append(mm_feature.data)
+                mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
+
+        return mm_kwargs, mm_hashes_pos
+
+    def _execute_mm_encoder(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[torch.Tensor]:
+        # Batch the multi-modal inputs using the helper method.
+        mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
+            scheduler_output
+        )
+
+        if not mm_kwargs:
+            return []
+
+        # Batch mm inputs as much as we can: if a request in the batch has
+        # multiple modalities or a different modality than the previous one,
+        # we process it separately to preserve item order.
+        # FIXME(ywang96): This is a hacky way to deal with multiple modalities
+        # in the same batch while still being able to benefit from batching
+        # multimodal inputs. The proper solution should be reordering the
+        # encoder outputs.
+        model = cast(SupportsMultiModal, self.model)
+        encoder_outputs: list[torch.Tensor] = []
+        for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            merge_by_field_config=model.merge_by_field_config,
+            multimodal_cpu_fields=model.multimodal_cpu_fields,
+        ):
+            curr_group_outputs: list[torch.Tensor] = []
+
+            # EVS-related change.
+            # (ekhvedchenia): Temporary hack to limit peak memory usage when
+            # processing multimodal data. This solves the issue with scheduler
+            # putting too many video samples into a single batch. Scheduler
+            # uses pruned vision tokens count to compare it versus compute
+            # budget which is incorrect (Either input media size or non-pruned
+            # output vision tokens count should be considered)
+            # TODO(ywang96): Fix memory profiling to take EVS into account and
+            # remove this hack.
+            if (
+                self.is_multimodal_pruning_enabled
+                and modality == "video"
+                and num_items > 1
+            ):
+                for video_mm_kwargs_item in filter(
+                    lambda item: item.modality == "video", mm_kwargs
+                ):
+                    _, _, micro_batch_mm_inputs = next(
+                        group_mm_kwargs_by_modality(
+                            [video_mm_kwargs_item],
+                            device=self.device,
+                            pin_memory=self.pin_memory,
+                            merge_by_field_config=model.merge_by_field_config,
+                            multimodal_cpu_fields=model.multimodal_cpu_fields,
+                        )
+                    )
+
+                    micro_batch_outputs = model.embed_multimodal(
+                        **micro_batch_mm_inputs
+                    )
+
+                    curr_group_outputs.extend(micro_batch_outputs)
+            else:
+                # Run the encoder.
+                # `curr_group_outputs` is either of the following:
+                # 1. A tensor of shape (num_items, feature_size, hidden_size)
+                # in case feature_size is fixed across all multimodal items.
+                # 2. A list or tuple (length: num_items) of tensors,
+                # each of shape (feature_size, hidden_size) in case the feature
+                # size is dynamic depending on the input multimodal items.
+                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)  # type: ignore[assignment]
+
+            sanity_check_mm_encoder_outputs(
+                curr_group_outputs,
+                expected_num_items=num_items,
+            )
+            encoder_outputs.extend(curr_group_outputs)
+
+        # Cache the encoder outputs by mm_hash
+        for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+            self.encoder_cache[mm_hash] = scatter_mm_placeholders(
+                output,
+                is_embed=pos_info.is_embed,
+            )
+            logger.debug("Finish execute for mm hash %s", mm_hash)
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+        return encoder_outputs
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: "SchedulerOutput",
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        mm_embeds = list[torch.Tensor]()
+        is_mm_embed = self.is_mm_embed.cpu
+        is_mm_embed[:total_num_scheduled_tokens] = False
+
+        req_start_idx = 0
+        should_sync_mrope_positions = False
+        should_sync_xdrope_positions = False
+
+        for req_id in self.input_batch.req_ids:
+            mm_embeds_req: list[torch.Tensor] = []
+
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens + shift_computed_tokens
+
+            for mm_feature in req_state.mm_features:
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                # The encoder output is needed if the two ranges overlap:
+                # [num_computed_tokens,
+                #  num_computed_tokens + num_scheduled_tokens) and
+                # [start_pos, start_pos + num_encoder_tokens)
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    # The encoder output is not needed in this step.
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    # The encoder output is already processed and stored
+                    # in the decoder's KV cache.
+                    continue
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                assert start_idx < end_idx
+
+                mm_hash = mm_feature.identifier
+                encoder_output = self.encoder_cache.get(mm_hash, None)
+                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+
+                if (is_embed := pos_info.is_embed) is not None:
+                    is_embed = is_embed[start_idx:end_idx]
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                is_mm_embed[req_start_pos + start_idx : req_start_pos + end_idx] = (
+                    True if is_embed is None else is_embed
+                )
+
+                mm_embeds_item = gather_mm_placeholders(
+                    encoder_output[start_idx:end_idx],
+                    is_embed=is_embed,
+                )
+                mm_embeds_req.append(mm_embeds_item)
+
+            if self.is_multimodal_pruning_enabled and self.uses_mrope:
+                assert req_state.mrope_positions is not None
+                should_sync_mrope_positions = True
+                mm_embeds_req, new_mrope_positions, new_delta = (
+                    self.model.recompute_mrope_positions(
+                        input_ids=req_state.prompt_token_ids,
+                        multimodal_embeddings=mm_embeds_req,
+                        mrope_positions=req_state.mrope_positions,
+                        num_computed_tokens=req_state.num_computed_tokens,
+                    )
+                )
+                req_state.mrope_positions.copy_(new_mrope_positions)
+                req_state.mrope_position_delta = new_delta
+
+            mm_embeds.extend(mm_embeds_req)
+            req_start_idx += num_scheduled_tokens
+
+        is_mm_embed = self.is_mm_embed.copy_to_gpu(total_num_scheduled_tokens)
+
+        if should_sync_mrope_positions:
+            self._calc_mrope_positions(scheduler_output)
+            self.mrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+
+        if should_sync_xdrope_positions:
+            self._calc_xdrope_positions(scheduler_output)
+            self.xdrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+
+        return mm_embeds, is_mm_embed
 
 def create_lora_mask(
     input_ids: torch.Tensor,
