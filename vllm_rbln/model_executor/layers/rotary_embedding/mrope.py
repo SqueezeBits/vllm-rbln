@@ -62,9 +62,9 @@ def mrope__custom_init__(
         h_limit = mrope_section_h * 3
         w_limit = mrope_section_w * 3
         
-        mask_h = (idxs % 3 == 1) & (idxs < h_limit)
+        mask_h = (idxs % 3 == 1) & (idxs <= h_limit)
         source_idx[mask_h] = 1
-        mask_w = (idxs % 3 == 2) & (idxs < w_limit)
+        mask_w = (idxs % 3 == 2) & (idxs <= w_limit)
         source_idx[mask_w] = 2
         
         self.register_buffer("mrope_interleaved_indices", source_idx, persistent=False)
