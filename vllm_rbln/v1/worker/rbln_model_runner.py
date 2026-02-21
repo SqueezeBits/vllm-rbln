@@ -404,6 +404,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_decode_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        # Keep compatibility with metadata builders that still reference the
+        # legacy `num_draft_tokens` field name.
+        self.num_draft_tokens = self.num_decode_draft_tokens
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int64
         )
@@ -1162,7 +1165,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
-            self.num_decode_draft_tokens.np[:num_reqs] = num_draft_tokens
+            self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
@@ -2459,6 +2462,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Padding length for speculative decoding by num_speculative_tokens
         if self.speculative_config is not None and not is_prefills[0]:
+            max_spec_decode_len = self.speculative_config.num_speculative_tokens + 1
             num_scheduled_tokens_per_req = torch.tensor(
                 [
                     scheduler_output.num_scheduled_tokens[i]
@@ -2470,13 +2474,29 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids = rbln_utils.pad_speculative_draft_tokens(
                 input_ids,
                 num_scheduled_tokens_per_req,
-                self.speculative_config.num_speculative_tokens + 1,
+                max_spec_decode_len,
             )
             positions = rbln_utils.pad_speculative_draft_tokens(
                 positions,
                 num_scheduled_tokens_per_req,
-                self.speculative_config.num_speculative_tokens + 1,
+                max_spec_decode_len,
             )
+            # `logits_indices` are built for the original flattened
+            # [req0_tokens, req1_tokens, ...] layout. After per-request padding,
+            # flatten order changes to fixed-stride rows
+            # [req0(max_spec), req1(max_spec), ...], so remap indices.
+            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req.to(torch.int64)
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_reqs, device=logits_indices.device),
+                num_scheduled_tokens_i64,
+            )
+            token_offsets = (
+                torch.arange(num_input_tokens, device=logits_indices.device)
+                - num_scheduled_tokens_i64.cumsum(0)[req_indices]
+                + num_scheduled_tokens_i64[req_indices]
+            )
+            unpadded_to_padded = req_indices * max_spec_decode_len + token_offsets
+            logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
