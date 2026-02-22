@@ -322,11 +322,9 @@ def custom_propose(
     # NOTE(RBLN): Logits tensor is a 2D tensor.
     if last_token_indices is None:
         last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
-        last_token_indices_2d = last_token_indices
-    else:
-        last_token_indices_2d = (last_token_indices % max_len_per_req).clamp(
-            0, max_len_per_req - 1
-        )
+    last_token_indices_2d = (last_token_indices % max_len_per_req).clamp(
+        0, max_len_per_req - 1
+    )
 
     num_tokens = target_token_ids.shape[0]
     batch_size = next_token_ids.shape[0]
