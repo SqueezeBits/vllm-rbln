@@ -42,6 +42,16 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _is_compilation_capture() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        return bool(compiler.is_compiling())
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        return bool(dynamo.is_compiling())
+    return False
+
+
 # RBLN custom op (flash attention naive prefill/decode)
 @torch.library.custom_op(
     "rbln_custom_ops::flash_attention_naive_prefill", mutates_args=["kv_cache"]
@@ -80,7 +90,7 @@ def flash_attention_naive_prefill_impl(
 
     batch size is assumed to be 1 for prefill.
     """
-    if not envs.VLLM_RBLN_COMPILE_MODEL:
+    if not envs.VLLM_RBLN_COMPILE_MODEL or not _is_compilation_capture():
         # attn_weights = MM(q,kt) * scale
         # attn_weights = add(attn_weights + mask)
         # attn_weights = softmax(attn_weights)
@@ -142,7 +152,7 @@ def flash_attention_naive_decode_impl(
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if not envs.VLLM_RBLN_COMPILE_MODEL:
+    if not envs.VLLM_RBLN_COMPILE_MODEL or not _is_compilation_capture():
         # NOTE: this reference impl works only for batch_size=1
         assert q.size(0) == 1
         partition = kv_cache.size(-2)
@@ -223,7 +233,7 @@ def flash_causal_attention_naive_prefill_impl(
 
     batch size is assumed to be 1 for prefill.
     """
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if envs.VLLM_RBLN_COMPILE_MODEL and _is_compilation_capture():
         return torch.empty_like(q)
 
     # This is just reference to test vllm-rbln independently of the actual RBLN
@@ -395,7 +405,7 @@ def flash_causal_attention_naive_decode_impl(
     slot_mapping: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if envs.VLLM_RBLN_COMPILE_MODEL and _is_compilation_capture():
         return torch.empty_like(q)
 
     # This is just reference to test vllm-rbln independently of the actual RBLN
@@ -580,7 +590,7 @@ def sliding_window_attention_naive_prefill_impl(
 
     batch size is assumed to be 1 for prefill.
     """
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if envs.VLLM_RBLN_COMPILE_MODEL and _is_compilation_capture():
         return torch.empty_like(q)
 
     window_size = kv_cache.size(-2)
@@ -685,7 +695,7 @@ def sliding_window_attention_naive_decode_impl(
     dummy: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if envs.VLLM_RBLN_COMPILE_MODEL and _is_compilation_capture():
         return torch.empty_like(q)
 
     window_size = kv_cache.size(-2)
@@ -887,6 +897,10 @@ class RBLNFlashAttentionMetadata:
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
+    # Force Python eager kernels for this metadata instance.
+    # Used by speculative drafters to avoid incorrect outputs from
+    # compiled kernel path while keeping the target model compiled.
+    force_eager_kernel: bool = False
 
 
 class RBLNFlashAttentionMetadataBuilder(
@@ -961,7 +975,24 @@ class RBLNFlashAttentionMetadataBuilder(
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        seq_idx = positions[:num_reqs].view(-1, 1)
+        # NOTE(RBLN):
+        # For decode with speculative verification, each request can have
+        # q_len > 1 tokens and `positions` is flattened as
+        # [req0_tokens..., req1_tokens..., ...]. In that case, taking
+        # `positions[:num_reqs]` mixes tokens across requests.
+        # Use query_start_loc to pick the first token position per request.
+        assert positions is not None, (
+            "positions is required for RBLN Attention Backend"
+        )
+        if positions.ndim == 1:
+            req_start_loc = common_attn_metadata.query_start_loc_cpu[:num_reqs].to(
+                torch.int64
+            )
+            seq_idx = positions.index_select(0, req_start_loc).view(-1, 1)
+        elif positions.ndim == 2:
+            seq_idx = positions[:num_reqs, :1].contiguous()
+        else:
+            raise ValueError(f"Unexpected positions rank: {positions.ndim}")
 
         # The length of the partition equals the block size.
         partition_len = self.block_size
@@ -1250,6 +1281,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         assert kv_cache is not None
+        use_compiled_kernel = (
+            envs.VLLM_RBLN_COMPILE_MODEL and not attn_metadata.force_eager_kernel
+        )
 
         if self.sliding_window is not None:
             assert self.sliding_window == kv_cache.size(-2), (
@@ -1257,7 +1291,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             )
             assert attn_metadata.cache_seq_lens is not None
             assert attn_metadata.cache_offsets is not None
-            if envs.VLLM_RBLN_COMPILE_MODEL:
+            if use_compiled_kernel:
                 if envs.VLLM_RBLN_KERNEL_MODE == "torch_triton":
                     sliding_window_attention_naive_prefill = (
                         torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill
@@ -1312,7 +1346,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 )
         # actually non-flash paged attention DOES NOT use slot_mapping
         elif self.is_causal:
-            if envs.VLLM_RBLN_COMPILE_MODEL:
+            if use_compiled_kernel:
                 if envs.VLLM_RBLN_KERNEL_MODE == "torch_triton":
                     flash_causal_attention_naive_prefill = (
                         torch.ops.rbln_triton_ops.flash_causal_attention_naive_prefill
@@ -1368,7 +1402,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     # self.sinks,
                 )
         else:
-            if envs.VLLM_RBLN_COMPILE_MODEL:
+            if use_compiled_kernel:
                 if envs.VLLM_RBLN_KERNEL_MODE == "torch_triton":
                     flash_attention_naive_prefill = (
                         torch.ops.rbln_triton_ops.flash_attention_naive_prefill
@@ -1420,7 +1454,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch,L,H*4*D]
-        if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        # NOTE(RBLN):
+        # The compiled view->transpose->view path only works safely when
+        # q_len == 1 (single-token decode). For speculative verification
+        # (q_len > 1), use reshape to allow non-contiguous intermediate
+        # layouts produced by transpose.
+        if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL or q_len > 1:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)

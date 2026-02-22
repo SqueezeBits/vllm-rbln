@@ -359,6 +359,8 @@ def custom_propose(
         fast_build=True,
         **extra_attn_metadata_args,
     )
+    if isinstance(attn_metadata, RBLNFlashAttentionMetadata):
+        attn_metadata.force_eager_kernel = True
 
     # FIXME: support hybrid kv for draft model (remove separate indexer)
     if self.draft_indexer_metadata_builder:
@@ -366,6 +368,8 @@ def custom_propose(
             common_attn_metadata=common_attn_metadata,
             draft_index=0,
         )
+        if isinstance(draft_indexer_metadata, RBLNFlashAttentionMetadata):
+            draft_indexer_metadata.force_eager_kernel = True
     else:
         draft_indexer_metadata = None
     # At this moment, we assume all eagle layers belong to the same KV
@@ -586,6 +590,8 @@ def custom_propose(
             fast_build=True,
             **extra_attn_metadata_args,
         )
+        if isinstance(attn_metadata, RBLNFlashAttentionMetadata):
+            attn_metadata.force_eager_kernel = True
 
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
