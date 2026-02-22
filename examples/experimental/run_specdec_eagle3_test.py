@@ -19,9 +19,9 @@ from pathlib import Path
 os.environ.setdefault("RBLN_USE_CUSTOM_KERNEL", "1")
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
-os.environ.setdefault("VLLM_RBLN_COMPILE_STRICT_MODE", "0")
+os.environ.setdefault("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
 os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-os.environ.setdefault("VLLM_RBLN_ENABLE_WARM_UP", "0")
+os.environ.setdefault("VLLM_RBLN_ENABLE_WARM_UP", "1")
 # vLLM(v0.10.2) bug: speculative decoding works only in multi-processing.
 # os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
@@ -31,15 +31,16 @@ from transformers import AutoConfig
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter, Vector
 
-MODEL_ID = "meta-llama/Llama-3.2-1B"
-EAGLE_MODEL_ID = os.getenv("EAGLE_MODEL_ID", "")
+# MODEL_ID = "meta-llama/Llama-3.2-1B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
+EAGLE_MODEL_ID = "AngelSlim/Qwen3-1.7B_eagle3"
 RANDOM_EAGLE_ADAPTER_DIR = "/tmp/rbln_random_eagle3_llama32_1b"
 NUM_SPECULATIVE_TOKENS = 3
 MAX_MODEL_LEN = 1024
 MAX_NUM_BATCHED_TOKENS = 64
 MAX_NUM_SEQS = 1
-DEFAULT_PROMPTS = ["The capital of France is"]
-DEFAULT_MAX_TOKENS = 4
+DEFAULT_PROMPTS = ["The capital of France is", "A robot may not injure a human being"]
+DEFAULT_MAX_TOKENS = 128
 
 
 def parse_args() -> argparse.Namespace:
