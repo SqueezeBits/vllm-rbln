@@ -19,10 +19,16 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.utils import (
+    eagle_prepare_inputs_padded_kernel,
+    eagle_prepare_next_token_padded_kernel,
+)
 from vllm.v1.utils import CpuGpuBuffer
 
 import vllm_rbln.utils as rbln_utils
@@ -148,6 +154,155 @@ def __custom_init__(
     ).repeat(max_batch_size, 1)
 
 
+def _next_power_of_2(num_tokens: int) -> int:
+    # Some environments expose a reduced triton module without helper utils.
+    if hasattr(triton, "next_power_of_2"):
+        return triton.next_power_of_2(num_tokens)
+    if num_tokens <= 1:
+        return 1
+    return 1 << (num_tokens - 1).bit_length()
+
+
+def custom_prepare_next_token_ids_padded(
+    self: EagleProposer,
+    common_attn_metadata: CommonAttentionMetadata,
+    sampled_token_ids: torch.Tensor,
+    requests,
+    gpu_input_batch,
+    discard_request_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_reqs = gpu_input_batch.num_reqs
+    self.backup_next_token_ids.np[:num_reqs] = np.array(
+        [
+            requests[gpu_input_batch.req_ids[i]].get_token_id(
+                common_attn_metadata.seq_lens_cpu[i].item()
+            )
+            for i in range(num_reqs)
+        ],
+        dtype=np.int32,
+    )
+    self.backup_next_token_ids.copy_to_gpu(num_reqs)
+    backup_tokens_gpu = self.backup_next_token_ids.gpu
+
+    batch_size, num_tokens = sampled_token_ids.shape
+    device = sampled_token_ids.device
+
+    assert discard_request_mask.dtype == torch.bool
+    assert backup_tokens_gpu.dtype == torch.int32
+
+    next_token_ids = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    valid_sampled_tokens_count = torch.empty(
+        (batch_size,), dtype=torch.int32, device=device
+    )
+
+    if hasattr(eagle_prepare_next_token_padded_kernel, "__getitem__"):
+        grid = (batch_size,)
+        block_size_tokens = _next_power_of_2(num_tokens)
+        eagle_prepare_next_token_padded_kernel[grid](
+            sampled_token_ids,
+            discard_request_mask,
+            backup_tokens_gpu,
+            next_token_ids,
+            valid_sampled_tokens_count,
+            gpu_input_batch.vocab_size,
+            num_tokens,
+            batch_size,
+            sampled_token_ids.stride(0),
+            BLOCK_SIZE_TOKENS=block_size_tokens,
+        )
+    else:
+        backup_tokens = backup_tokens_gpu[:batch_size]
+        discard_mask = discard_request_mask[:batch_size]
+        valid_mask = (sampled_token_ids != -1) & (
+            sampled_token_ids < gpu_input_batch.vocab_size
+        )
+        valid_sampled_tokens_count[:] = valid_mask.sum(dim=1, dtype=torch.int32)
+
+        rev_valid = torch.flip(valid_mask, dims=[1]).to(torch.int32)
+        last_from_back = torch.argmax(rev_valid, dim=1)
+        last_valid_idx = (num_tokens - 1) - last_from_back
+        last_valid_token = sampled_token_ids.gather(
+            1, last_valid_idx.unsqueeze(1)
+        ).squeeze(1)
+        has_valid = valid_sampled_tokens_count > 0
+
+        next_token_ids[:] = torch.where(
+            has_valid,
+            last_valid_token.to(torch.int32),
+            backup_tokens,
+        )
+        valid_sampled_tokens_count[:] = torch.where(
+            discard_mask,
+            torch.zeros_like(valid_sampled_tokens_count),
+            valid_sampled_tokens_count,
+        )
+        next_token_ids[:] = torch.where(discard_mask, backup_tokens, next_token_ids)
+
+    return next_token_ids, valid_sampled_tokens_count
+
+
+def custom_prepare_inputs_padded(
+    self: EagleProposer,
+    common_attn_metadata: CommonAttentionMetadata,
+    spec_decode_metadata: SpecDecodeMetadata,
+    valid_sampled_tokens_count: torch.Tensor,
+) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+    num_reqs = common_attn_metadata.num_reqs
+    device = valid_sampled_tokens_count.device
+
+    token_indices_to_sample = torch.empty(
+        (num_reqs,), dtype=torch.int32, device=device
+    )
+
+    if hasattr(eagle_prepare_inputs_padded_kernel, "__getitem__"):
+        grid = (num_reqs,)
+        eagle_prepare_inputs_padded_kernel[grid](
+            spec_decode_metadata.cu_num_draft_tokens,
+            valid_sampled_tokens_count,
+            common_attn_metadata.query_start_loc,
+            token_indices_to_sample,
+            num_reqs,
+        )
+    else:
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens.to(torch.int32)
+        prev_cu = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                cu_num_draft_tokens[:-1],
+            ]
+        )
+        num_draft_tokens = cu_num_draft_tokens - prev_cu
+        num_rejected_tokens = num_draft_tokens + 1 - valid_sampled_tokens_count
+        num_rejected_tokens = torch.where(
+            num_draft_tokens > 0,
+            num_rejected_tokens,
+            torch.zeros_like(num_rejected_tokens),
+        )
+        q_last_tok_idx = common_attn_metadata.query_start_loc[1:] - 1
+        token_indices_to_sample[:] = q_last_tok_idx - num_rejected_tokens
+
+    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+    new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    total_num_tokens = query_start_loc_cpu[-1].item()
+
+    spec_common_attn_metadata = CommonAttentionMetadata(
+        query_start_loc=common_attn_metadata.query_start_loc,
+        seq_lens=common_attn_metadata.seq_lens,
+        query_start_loc_cpu=query_start_loc_cpu,
+        _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
+        _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+        num_reqs=common_attn_metadata.num_reqs,
+        num_actual_tokens=total_num_tokens,
+        max_query_len=new_query_len_per_req.max().item(),
+        max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
+        block_table_tensor=common_attn_metadata.block_table_tensor,
+        slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+        causal=True,
+        dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+    )
+    return spec_common_attn_metadata, token_indices_to_sample
+
+
 def custom_propose(
     self: EagleProposer,
     target_token_ids: torch.Tensor,
@@ -197,6 +352,7 @@ def custom_propose(
     extra_attn_metadata_args = {}
     extra_attn_metadata_args["num_tokens"] = self.runner.input_batch.num_tokens_no_spec
     extra_attn_metadata_args["positions"] = target_positions.cpu()
+    extra_attn_metadata_args["batch_pad"] = self.runner.max_num_seqs
     attn_metadata = attn_metadata_builder.build(
         common_prefix_len=0,
         common_attn_metadata=common_attn_metadata,
@@ -383,12 +539,12 @@ def custom_propose(
         common_attn_metadata.seq_lens += 1
         # This is an out-of-place operation to avoid modifying
         # the original tensor.
-        common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
+        common_attn_metadata._seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
 
         # For the requests that exceed the max model length, we set the
         # sequence length to 1 to minimize their overheads in attention.
         # common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-        common_attn_metadata.num_computed_tokens_cpu = (
+        common_attn_metadata._num_computed_tokens_cpu = (
             common_attn_metadata.seq_lens_cpu - 1
         )
 
@@ -423,6 +579,7 @@ def custom_propose(
             common_attn_metadata.num_computed_tokens_cpu.numpy()
         )
         extra_attn_metadata_args["positions"] = positions.cpu()
+        extra_attn_metadata_args["batch_pad"] = self.runner.max_num_seqs
         attn_metadata = attn_metadata_builder.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
@@ -486,4 +643,6 @@ def custom_propose(
 
 
 EagleProposer.__init__ = __custom_init__
+EagleProposer.prepare_next_token_ids_padded = custom_prepare_next_token_ids_padded
+EagleProposer.prepare_inputs_padded = custom_prepare_inputs_padded
 EagleProposer.propose = custom_propose
