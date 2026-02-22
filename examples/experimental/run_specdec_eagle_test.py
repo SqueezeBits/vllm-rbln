@@ -11,48 +11,222 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
+import json
 import os
+from pathlib import Path
+import re
 
-os.environ["RBLN_PROFILER"] = "0"
-os.environ["RBLN_KERNEL_MODE"] = "triton"
-os.environ["VLLM_USE_V1"] = "1"
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+os.environ.setdefault("RBLN_USE_CUSTOM_KERNEL", "1")
+os.environ.setdefault("VLLM_USE_V1", "1")
+os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
+os.environ.setdefault("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+os.environ.setdefault("VLLM_RBLN_ENABLE_WARM_UP", "1")
 # vLLM(v0.10.2) bug: speculative decoding works only in multi-processing.
 # os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+import torch
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+from transformers import AutoConfig
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter, Vector
 
-MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
-EAGLE_MODEL_ID = "yuhuili/EAGLE-LLaMA3.1-Instruct-8B"
+MODEL_ID = "meta-llama/Llama-3.2-1B"
+EAGLE_MODEL_ID = "JKroller/llama3.2-1b-eagle"
+DEFAULT_CONVERTED_EAGLE_ADAPTER_DIR = "/tmp/rbln_converted_eagle_llama32_1b"
 NUM_SPECULATIVE_TOKENS = 3
+MAX_MODEL_LEN = 2048
+MAX_NUM_BATCHED_TOKENS = 256
+MAX_NUM_SEQS = 4
+DEFAULT_MAX_TOKENS = 128
+DEFAULT_PROMPTS = [
+    "A robot may not injure a human being",
+    "The capital of France is",
+]
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Eagle speculative decoding on vLLM-RBLN. "
+            "Adapters without config.json are converted to a local format."
+        )
+    )
+    parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument("--eagle-model-id", default=EAGLE_MODEL_ID)
+    parser.add_argument(
+        "--converted-adapter-dir",
+        default=DEFAULT_CONVERTED_EAGLE_ADAPTER_DIR,
+        help="Directory used for converted Eagle adapters.",
+    )
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=NUM_SPECULATIVE_TOKENS,
+    )
+    parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
+    parser.add_argument("--block-size", type=int, default=MAX_MODEL_LEN)
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=MAX_NUM_BATCHED_TOKENS,
+    )
+    parser.add_argument("--max-num-seqs", type=int, default=MAX_NUM_SEQS)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument(
+        "--prompts",
+        nargs="+",
+        default=DEFAULT_PROMPTS,
+        help="One or more prompts to generate from.",
+    )
+    return parser.parse_args()
+
+
+def _load_json(path: str | Path) -> dict:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _remote_has_config(model_id: str) -> bool:
+    try:
+        hf_hub_download(model_id, "config.json")
+        return True
+    except Exception:
+        return False
+
+
+def _infer_num_draft_layers(weight_keys: list[str]) -> int:
+    layer_indices: set[int] = set()
+    layer_pattern = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+    for key in weight_keys:
+        if (m := layer_pattern.match(key)) is not None:
+            layer_indices.add(int(m.group(1)))
+    if not layer_indices:
+        raise ValueError("Could not infer Eagle draft layer count from weights.")
+    return max(layer_indices) + 1
+
+
+def _map_external_eagle_state_dict(
+    source_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in source_state_dict.items():
+        new_key = key
+        if new_key.startswith("model."):
+            new_key = new_key[len("model.") :]
+        if new_key == "fusion.fc.bias":
+            # vLLM Eagle Llama uses fc without bias.
+            continue
+        if new_key.startswith("fusion.fc."):
+            new_key = f"fc.{new_key[len('fusion.fc.') :]}"
+        converted[new_key] = value
+    return converted
+
+
+def _validate_converted_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    num_draft_layers: int,
+) -> None:
+    required_keys = {"fc.weight"}
+    required_layer_suffixes = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "post_attention_layernorm.weight",
+    )
+    for layer_idx in range(num_draft_layers):
+        for suffix in required_layer_suffixes:
+            required_keys.add(f"layers.{layer_idx}.{suffix}")
+
+    missing = [key for key in sorted(required_keys) if key not in state_dict]
+    if missing:
+        raise ValueError(f"Missing required Eagle tensors after conversion: {missing}")
+
+
+def ensure_converted_eagle_adapter(
+    *,
+    eagle_model_id: str,
+    base_model_id: str,
+    converted_adapter_dir: str,
+) -> str:
+    model_path = Path(eagle_model_id)
+    if model_path.exists() and (model_path / "config.json").is_file():
+        return str(model_path)
+    if _remote_has_config(eagle_model_id):
+        return eagle_model_id
+
+    source_weights_path = hf_hub_download(eagle_model_id, "model.safetensors")
+    snapshot_dir = Path(source_weights_path).parent
+    snapshot_id = snapshot_dir.name
+    out_dir = Path(converted_adapter_dir) / f"{Path(eagle_model_id).name}_{snapshot_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_config_path = out_dir / "config.json"
+    out_weights_path = out_dir / "model.safetensors"
+
+    with safe_open(source_weights_path, framework="pt", device="cpu") as f:
+        source_keys = list(f.keys())
+    num_draft_layers = _infer_num_draft_layers(source_keys)
+
+    base_config = AutoConfig.from_pretrained(base_model_id)
+    out_config = base_config.to_dict()
+    out_config["num_hidden_layers"] = num_draft_layers
+    out_config["draft_vocab_size"] = int(base_config.vocab_size)
+    out_config["dtype"] = "bfloat16"
+    out_config["torch_dtype"] = "bfloat16"
+
+    if out_config_path.exists() and out_weights_path.exists():
+        existing = _load_json(out_config_path)
+        if existing == out_config:
+            return str(out_dir)
+
+    source_state_dict = load_file(source_weights_path)
+    converted_state_dict = _map_external_eagle_state_dict(source_state_dict)
+    _validate_converted_state_dict(converted_state_dict, num_draft_layers)
+    save_file(converted_state_dict, str(out_weights_path))
+    out_config_path.write_text(json.dumps(out_config, indent=2), encoding="utf-8")
+    return str(out_dir)
+
+
+def main() -> None:
+    args = parse_args()
+    eagle_model_id = ensure_converted_eagle_adapter(
+        eagle_model_id=args.eagle_model_id,
+        base_model_id=args.model_id,
+        converted_adapter_dir=args.converted_adapter_dir,
+    )
+    print(f"EAGLE adapter path: {eagle_model_id}")
+
     # Create an LLM.
     llm = LLM(
-        model=MODEL_ID,
-        max_model_len=2048,
-        block_size=1024,
+        model=args.model_id,
+        max_model_len=args.max_model_len,
+        block_size=args.block_size,
         enable_chunked_prefill=True,
-        max_num_batched_tokens=256,
-        max_num_seqs=4,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
         speculative_config={
             "method": "eagle",
-            "model": EAGLE_MODEL_ID,
-            "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
+            "model": eagle_model_id,
+            "num_speculative_tokens": args.num_speculative_tokens,
         },
         disable_log_stats=False,
-        tensor_parallel_size=2,
-        gpu_memory_utilization=0.5,
     )
 
-    prompts = [
-        "A robot may not injure a human being",
-        "The capital of France is",
-    ]
-    sampling_params = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=128)
-    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+    )
+    outputs = llm.generate(args.prompts, sampling_params=sampling_params)
 
     for output in outputs:
         print("-" * 50)
@@ -72,7 +246,7 @@ def main():
     num_drafts = 0
     num_draft_tokens = 0
     num_accepted_tokens = 0
-    acceptance_counts = [0] * NUM_SPECULATIVE_TOKENS
+    acceptance_counts = [0] * args.num_speculative_tokens
     for metric in metrics:
         if metric.name == "vllm:spec_decode_num_drafts":
             assert isinstance(metric, Counter)
@@ -85,7 +259,8 @@ def main():
             num_accepted_tokens += metric.value
         elif metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
             assert isinstance(metric, Vector)
-            for pos in range(len(metric.values)):
+            num_positions = min(len(metric.values), len(acceptance_counts))
+            for pos in range(num_positions):
                 acceptance_counts[pos] += metric.values[pos]
 
     print("-" * 50)
@@ -98,9 +273,9 @@ def main():
     print("-" * 50)
 
     # print acceptance at each token position
-    for i in range(len(acceptance_counts)):
-        acceptance_rate = acceptance_counts[i] / num_drafts if num_drafts > 0 else 0
-        print(f"acceptance at token {i}: {acceptance_rate:.2f}")
+    for pos, accepted_at_pos in enumerate(acceptance_counts):
+        acceptance_rate = accepted_at_pos / num_drafts if num_drafts > 0 else 0
+        print(f"acceptance at token {pos}: {acceptance_rate:.2f}")
 
 
 if __name__ == "__main__":

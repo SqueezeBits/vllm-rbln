@@ -1343,12 +1343,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # compile compute_logits
         # FIXME(jiwoo.park): method assignment for torch.compile
-        self.compute_logits = torch.compile(  # type: ignore[method-assign]
-            self.compute_logits,
-            backend="rbln",
-            options=copy(options),
-            dynamic=False,
-        )
+        #
+        # NOTE(RBLN):
+        # Eagle/Eagle3 verifier runs with multi-token decode (q_len > 1).
+        # Keeping compute_logits uncompiled avoids shape-specialization issues
+        # observed in this path.
+        if not (
+            self.speculative_config is not None
+            and self.speculative_config.method in ("eagle", "eagle3")
+        ):
+            self.compute_logits = torch.compile(  # type: ignore[method-assign]
+                self.compute_logits,
+                backend="rbln",
+                options=copy(options),
+                dynamic=False,
+            )
 
         compiled_model = torch.compile(
             model,
