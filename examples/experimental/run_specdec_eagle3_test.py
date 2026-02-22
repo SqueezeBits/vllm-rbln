@@ -38,7 +38,7 @@ RANDOM_EAGLE_ADAPTER_DIR = "/tmp/rbln_random_eagle3_llama32_1b"
 NUM_SPECULATIVE_TOKENS = 3
 MAX_MODEL_LEN = 1024
 MAX_NUM_BATCHED_TOKENS = 64
-MAX_NUM_SEQS = 1
+MAX_NUM_SEQS = 2
 DEFAULT_PROMPTS = ["The capital of France is", "A robot may not injure a human being"]
 DEFAULT_MAX_TOKENS = 128
 
