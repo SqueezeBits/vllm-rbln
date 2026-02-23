@@ -86,9 +86,15 @@ def top_k_top_p_fake(
 
 
 class RBLNSampler(VLLMSampler):
-    def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs", seed: int = 42):
+    def __init__(
+        self,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        seed: int = 42,
+        fixed_batch_size: int | None = None,
+    ):
         super().__init__()
         rebel.manual_seed(seed)
+        self.fixed_batch_size = fixed_batch_size
 
         options = {"compile_context": rebel.CompileContext()}
         if envs.VLLM_RBLN_COMPILE_STRICT_MODE:
@@ -117,16 +123,75 @@ class RBLNSampler(VLLMSampler):
     def apply_topk_topp_sampler(
         self,
         logits: torch.Tensor,
-        top_k: torch.Tensor | None,
-        top_p: torch.Tensor | None,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        logits_for_logprobs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         sampled = self.rbln_topk_topp_sampler(logits, top_k, top_p)
+        source_logits = logits if logits_for_logprobs is None else logits_for_logprobs
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
-            logits_to_return = logits
+            logits_to_return = source_logits
         elif self.logprobs_mode == "processed_logprobs":
-            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+            logits_to_return = source_logits.log_softmax(dim=-1, dtype=torch.float32)
         return sampled, logits_to_return
+
+    @staticmethod
+    def _normalize_sampler_params(
+        logits: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = logits.size(0)
+        device = logits.device
+        vocab_size = logits.size(-1)
+
+        if top_k is None:
+            top_k = torch.full((batch_size,), vocab_size, dtype=torch.int32, device=device)
+        else:
+            top_k = top_k.to(device=device, dtype=torch.int32).view(-1)
+
+        if top_p is None:
+            top_p = torch.ones((batch_size,), dtype=torch.float32, device=device)
+        else:
+            top_p = top_p.to(device=device, dtype=torch.float32).view(-1)
+
+        return top_k, top_p
+
+    @staticmethod
+    def _pack_sampler_inputs(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        target_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = min(logits.size(0), target_batch_size)
+        vocab_size = logits.size(-1)
+        packed_logits = torch.zeros(
+            (target_batch_size, vocab_size), dtype=logits.dtype, device=logits.device
+        )
+        packed_logits[:batch_size].copy_(logits[:batch_size])
+
+        if top_k.numel() > 0:
+            packed_top_k = top_k[:1].repeat(target_batch_size)
+            packed_top_k[:batch_size].copy_(top_k[:batch_size])
+        else:
+            packed_top_k = torch.full(
+                (target_batch_size,),
+                vocab_size,
+                dtype=top_k.dtype,
+                device=top_k.device,
+            )
+
+        if top_p.numel() > 0:
+            packed_top_p = top_p[:1].repeat(target_batch_size)
+            packed_top_p[:batch_size].copy_(top_p[:batch_size])
+        else:
+            packed_top_p = torch.ones(
+                (target_batch_size,), dtype=top_p.dtype, device=top_p.device
+            )
+
+        return packed_logits, packed_top_k, packed_top_p
 
     @staticmethod
     def _rbln_topk_topp_sampler_impl(
@@ -170,7 +235,9 @@ class RBLNSampler(VLLMSampler):
         if sampling_metadata.all_random:
             greedy_sampled = None
         else:
-            greedy_sampled = self.rbln_topk_topp_sampler(logits, None, None)
+            # Keep the greedy path out of the compiled top-k/top-p graph to
+            # avoid recompiles caused by optional None sampler arguments.
+            greedy_sampled = logits.argmax(dim=-1)
             if sampling_metadata.all_greedy:
                 processed_logprobs = None
                 if sampling_metadata.max_num_logprobs is not None:
@@ -191,9 +258,23 @@ class RBLNSampler(VLLMSampler):
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits = processor.apply(logits)
 
-        random_sampled, processed_logprobs = self.apply_topk_topp_sampler(
+        top_k, top_p = self._normalize_sampler_params(
             logits, sampling_metadata.top_k, sampling_metadata.top_p
         )
+        sample_batch_size = logits.size(0)
+        logits_for_logprobs = logits
+        if self.fixed_batch_size is not None:
+            logits, top_k, top_p = self._pack_sampler_inputs(
+                logits, top_k, top_p, self.fixed_batch_size
+            )
+
+        random_sampled, processed_logprobs = self.apply_topk_topp_sampler(
+            logits,
+            top_k,
+            top_p,
+            logits_for_logprobs=logits_for_logprobs,
+        )
+        random_sampled = random_sampled[:sample_batch_size]
 
         if greedy_sampled is None:
             return random_sampled, processed_logprobs

@@ -272,6 +272,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 seed=self.vllm_config.model_config.seed,
+                fixed_batch_size=self.max_num_reqs,
             )
         else:
             logger.info("Using default vLLM sampler.")
@@ -310,8 +311,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
-            # elif self.speculative_config.method == "suffix":
-            #     self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "suffix":
+                self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)  # type: ignore
                 if self.speculative_config.method == "eagle3":
