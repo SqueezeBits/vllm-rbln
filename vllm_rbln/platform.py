@@ -45,6 +45,14 @@ from vllm_rbln.utils.optimum.registry import (
 logger = init_logger(__name__)
 
 
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    value = getattr(envs, name, None)
+    if value is None:
+        fallback = "1" if default else "0"
+        return os.getenv(name, fallback) == "1"
+    return bool(value)
+
+
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
     return graph_module.forward
 
@@ -139,7 +147,74 @@ class RblnPlatform(Platform):
             os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
 
     @classmethod
+    def _normalize_kv_connector_name(cls, vllm_config: VllmConfig) -> None:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return
+
+        connector_name = kv_transfer_config.kv_connector
+        if connector_name is None:
+            return
+
+        # Keep legacy connector names compatible with current vLLM connector
+        # registry to avoid engine startup failures in disaggregation scripts.
+        connector_aliases = {
+            "SharedStorageConnector": "ExampleConnector",
+            "LMCacheConnector": "LMCacheConnectorV1",
+        }
+
+        mapped_name = connector_aliases.get(connector_name)
+        if mapped_name is not None:
+            logger.warning(
+                "KV connector '%s' is deprecated or unavailable in this vLLM version. "
+                "Using '%s' instead.",
+                connector_name,
+                mapped_name,
+            )
+            kv_transfer_config.kv_connector = mapped_name
+            connector_name = mapped_name
+
+        # RBLN currently cannot use LMCache's CUDA/XPU-only vLLM integration
+        # path. Route LMCache requests to a host-mediated connector fallback.
+        if connector_name != "LMCacheConnectorV1":
+            return
+
+        if os.getenv("VLLM_RBLN_STRICT_LMCACHE", "0") == "1":
+            logger.warning(
+                "Strict LMCache mode enabled (VLLM_RBLN_STRICT_LMCACHE=1). "
+                "Using RBLN strict connector 'RBLNLMCacheConnectorV1'."
+            )
+            kv_transfer_config.kv_connector = "RBLNLMCacheConnectorV1"
+            kv_transfer_config.kv_connector_module_path = (
+                "vllm_rbln.v1.kv_connector.rbln_lmcache_connector"
+            )
+            return
+
+        connector_extra_config = dict(kv_transfer_config.kv_connector_extra_config or {})
+        connector_extra_config.setdefault(
+            "shared_storage_path",
+            os.getenv(
+                "VLLM_RBLN_LMCACHE_FALLBACK_SHARED_PATH",
+                "/tmp/rbln_lmcache_host_shared",
+            ),
+        )
+        kv_transfer_config.kv_connector_extra_config = connector_extra_config
+        kv_transfer_config.kv_connector = "RBLNHostConnector"
+        kv_transfer_config.kv_connector_module_path = (
+            "vllm_rbln.v1.kv_connector.rbln_host_connector"
+        )
+
+        logger.warning(
+            "LMCacheConnectorV1 is not currently supported on RBLN's vLLM "
+            "integration path. Using host-mediated fallback connector "
+            "'RBLNHostConnector' via module '%s'.",
+            kv_transfer_config.kv_connector_module_path,
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        cls._normalize_kv_connector_name(vllm_config)
+
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config

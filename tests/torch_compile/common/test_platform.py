@@ -16,6 +16,7 @@ import torch
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.attention.selector import AttentionSelectorConfig
+from vllm.config import KVTransferConfig
 
 
 def test_platform_plugins():
@@ -100,4 +101,67 @@ def test_get_attn_backend_cls():
     ), (
         f"Expected 'vllm_rbln.attention.backends.flash_attention.\
         RBLNAttentionBackend', got {attn_backend_cls}"
+    )
+
+
+def test_check_and_update_config_normalizes_legacy_shared_storage_connector(
+    vllm_config,
+):
+    from vllm_rbln.platform import RblnPlatform
+
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="SharedStorageConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"shared_storage_path": "/tmp"},
+    )
+
+    RblnPlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.kv_transfer_config is not None
+    assert vllm_config.kv_transfer_config.kv_connector == "ExampleConnector"
+
+
+def test_check_and_update_config_routes_lmcache_connector_to_rbln_host(vllm_config):
+    from vllm_rbln.platform import RblnPlatform
+
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="LMCacheConnectorV1",
+        kv_role="kv_producer",
+    )
+
+    RblnPlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.kv_transfer_config is not None
+    assert vllm_config.kv_transfer_config.kv_connector == "RBLNHostConnector"
+    assert (
+        vllm_config.kv_transfer_config.kv_connector_module_path
+        == "vllm_rbln.v1.kv_connector.rbln_host_connector"
+    )
+    assert vllm_config.kv_transfer_config.kv_connector_extra_config is not None
+    assert (
+        vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "shared_storage_path"
+        )
+        == "/tmp/rbln_lmcache_host_shared"
+    )
+
+
+def test_check_and_update_config_keeps_strict_lmcache_connector(
+    monkeypatch, vllm_config
+):
+    from vllm_rbln.platform import RblnPlatform
+
+    monkeypatch.setenv("VLLM_RBLN_STRICT_LMCACHE", "1")
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="LMCacheConnectorV1",
+        kv_role="kv_producer",
+    )
+
+    RblnPlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.kv_transfer_config is not None
+    assert vllm_config.kv_transfer_config.kv_connector == "RBLNLMCacheConnectorV1"
+    assert (
+        vllm_config.kv_transfer_config.kv_connector_module_path
+        == "vllm_rbln.v1.kv_connector.rbln_lmcache_connector"
     )

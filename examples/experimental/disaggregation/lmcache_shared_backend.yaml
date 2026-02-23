@@ -1,0 +1,17 @@
+# Shared-backend sample for strict LMCache disaggregation smoke on RBLN.
+# This enables a filesystem-backed cache path that is visible across processes.
+#
+# NOTE:
+# - Use a deterministic hash function for cross-process cache-key stability.
+# - Keep PYTHONHASHSEED fixed (for example 0) across producer/consumer
+#   launches for distributed/disaggregated runs.
+# - Depending on LMCache version/runtime, additional backend tuning may be
+#   required to observe non-zero hit tokens.
+
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 5.0
+local_disk: /tmp/rbln_lmcache_disk_shared
+max_local_disk_size: 5.0
+pre_caching_hash_algorithm: "sha256_cbor"
+enable_p2p: false

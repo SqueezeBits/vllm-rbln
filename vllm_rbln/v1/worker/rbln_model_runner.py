@@ -307,6 +307,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+        self.cross_layers_kv_cache: torch.Tensor | None = None
+        self.cross_layers_attn_backend: type[AttentionBackend] | None = None
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -2498,7 +2500,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("Preprocess"):
             self._update_states(scheduler_output)
             if not num_scheduled_tokens:
-                if not has_kv_transfer_group():
+                if (
+                    not has_kv_transfer_group()
+                    or scheduler_output.kv_connector_metadata is None
+                ):
                     # Return empty ModelRunnerOutput if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)

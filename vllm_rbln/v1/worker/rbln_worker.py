@@ -34,8 +34,12 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
@@ -299,6 +303,20 @@ class RBLNWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """Get KV connector metadata from this worker if available."""
+
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        # Return None for connectors that don't need handshake metadata.
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        tp_rank = get_tp_group().rank_in_group
+        return {tp_rank: metadata}
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
         self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -375,10 +393,7 @@ class RBLNWorker(WorkerBase):
 
         # In case of PP with kv transfer, we need to pass through the
         # kv_connector_output
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
+        if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
