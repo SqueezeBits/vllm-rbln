@@ -1865,14 +1865,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         dummy_decode_num_scheduled_tokens,
                         num_kv_cache_groups,
                     )
-                    if self.specialized_moe_decode:
-                        self._execute_dummy_requests(
-                            so,
-                            cso,
-                            current_intermediate_tensors,
-                            num_padded_tokens=self.max_num_batched_tokens,
-                        )
-                    self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+                    self._execute_dummy_requests_for_warmup(
+                        so,
+                        cso,
+                        current_intermediate_tensors,
+                    )
 
                     # Warm up speculative decode input path by populating
                     # scheduled_spec_decode_tokens during decode.
@@ -1887,15 +1884,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_kv_cache_groups,
                             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                         )
-                        if self.specialized_moe_decode:
-                            self._execute_dummy_requests(
-                                so,
-                                cso,
-                                current_intermediate_tensors,
-                                num_padded_tokens=self.max_num_batched_tokens,
-                            )
-                        self._execute_dummy_requests(
-                            so, cso, current_intermediate_tensors
+                        self._execute_dummy_requests_for_warmup(
+                            so,
+                            cso,
+                            current_intermediate_tensors,
                         )
 
             # Warm up cached-request decode path for partial batches.
@@ -1926,13 +1918,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     seed_num_scheduled_tokens,
                     num_kv_cache_groups,
                 )
-                if self.specialized_moe_decode:
-                    self._execute_dummy_scheduler_output(
-                        seed_so,
-                        current_intermediate_tensors,
-                        num_padded_tokens=self.max_num_batched_tokens,
-                    )
-                self._execute_dummy_scheduler_output(
+                self._execute_dummy_scheduler_output_for_warmup(
                     seed_so,
                     current_intermediate_tensors,
                 )
@@ -1953,14 +1939,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     num_computed_tokens=cached_num_computed_tokens,
                     num_kv_cache_groups=num_kv_cache_groups,
                 )
-                if self.specialized_moe_decode:
-                    self._execute_dummy_requests(
-                        so,
-                        cso,
-                        current_intermediate_tensors,
-                        num_padded_tokens=self.max_num_batched_tokens,
-                    )
-                self._execute_dummy_requests(so, cso, current_intermediate_tensors)
+                self._execute_dummy_requests_for_warmup(
+                    so,
+                    cso,
+                    current_intermediate_tensors,
+                )
 
         self._warm_up_sampler()
 
@@ -2150,6 +2133,41 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         self._execute_dummy_scheduler_output(
             cleanup_sched_output, intermediate_tensors, num_padded_tokens
+        )
+
+    def _execute_dummy_scheduler_output_for_warmup(
+        self,
+        sched_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors,
+    ) -> None:
+        if self.specialized_moe_decode:
+            self._execute_dummy_scheduler_output(
+                sched_output,
+                intermediate_tensors,
+                num_padded_tokens=self.max_num_batched_tokens,
+            )
+        self._execute_dummy_scheduler_output(
+            sched_output,
+            intermediate_tensors,
+        )
+
+    def _execute_dummy_requests_for_warmup(
+        self,
+        sched_output: SchedulerOutput,
+        cleanup_sched_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors,
+    ) -> None:
+        if self.specialized_moe_decode:
+            self._execute_dummy_requests(
+                sched_output,
+                cleanup_sched_output,
+                intermediate_tensors,
+                num_padded_tokens=self.max_num_batched_tokens,
+            )
+        self._execute_dummy_requests(
+            sched_output,
+            cleanup_sched_output,
+            intermediate_tensors,
         )
 
     def _execute_dummy_scheduler_output(
