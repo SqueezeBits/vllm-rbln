@@ -1765,12 +1765,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def warm_up_model(self) -> None:
-        self._warm_up_model_impl()
-
-    def _warm_up_model_impl(self) -> None:
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
-        spec_method = self.speculative_config.method if self.speculative_config else None
-        use_extended_warmup = spec_method == "ngram"
 
         logger.info("Warm up prefill graph")
         prefill_seq_len = (
@@ -1778,191 +1773,79 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.scheduler_config.enable_chunked_prefill
             else self.model_config.max_model_len
         )
-        prefill_warmup_seq_lens = [prefill_seq_len]
-        short_prefill_seq_len = min(prefill_seq_len, 16)
-        if use_extended_warmup and short_prefill_seq_len != prefill_seq_len:
-            prefill_warmup_seq_lens.append(short_prefill_seq_len)
-
-        for prefill_warmup_seq_len in prefill_warmup_seq_lens:
-            dummy_prefill_requests: list[NewRequestData] = []
-            dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
-            self._add_dummy_requests(
-                requests=dummy_prefill_requests,
-                num_scheduled_tokens=dummy_prefill_num_scheduled_tokens,
-                total_tokens=prefill_warmup_seq_len,
-                num_computed_tokens=0,
-                num_kv_cache_groups=num_kv_cache_groups,
-                sampling_params=None
-                if self.is_pooling_model
-                else SamplingParams(temperature=0.0),
-                pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
-                if self.is_pooling_model
-                else None,
-            )
-            so, cso = self._make_dummy_scheduler_outputs(
-                dummy_prefill_requests,
-                dummy_prefill_num_scheduled_tokens,
-                num_kv_cache_groups,
-            )
-            self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
+        dummy_prefill_requests: list[NewRequestData] = []
+        dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
+        self._add_dummy_requests(
+            requests=dummy_prefill_requests,
+            num_scheduled_tokens=dummy_prefill_num_scheduled_tokens,
+            total_tokens=prefill_seq_len,
+            num_computed_tokens=0,
+            num_kv_cache_groups=num_kv_cache_groups,
+            sampling_params=None
+            if self.is_pooling_model
+            else SamplingParams(temperature=0.0),
+            pooling_params=PoolingParams(task=self.get_supported_pooling_tasks()[0])
+            if self.is_pooling_model
+            else None,
+        )
+        so, cso = self._make_dummy_scheduler_outputs(
+            dummy_prefill_requests,
+            dummy_prefill_num_scheduled_tokens,
+            num_kv_cache_groups,
+        )
+        self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
             decode_max_seq_len = self.max_model_len
 
+            dummy_decode_requests: list[NewRequestData] = []
+            dummy_decode_num_scheduled_tokens: dict[str, int] = {}
             num_speculative_tokens = (
                 self.speculative_config.num_speculative_tokens
                 if self.speculative_config is not None
                 else 0
             )
-            if num_speculative_tokens > 0:
-                if use_extended_warmup:
-                    # Compile both decode(1 token/req) and decode(1+spec tokens/req).
-                    decode_warmup_spec_tokens = [0, num_speculative_tokens]
-                else:
-                    decode_warmup_spec_tokens = [num_speculative_tokens]
-            else:
-                decode_warmup_spec_tokens = [0]
-            if use_extended_warmup:
-                decode_warmup_num_reqs = sorted(
-                    {1, max(1, batch_bucket_size // 2), batch_bucket_size}
+            for _ in range(batch_bucket_size):
+                self._add_dummy_requests(
+                    requests=dummy_decode_requests,
+                    num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
+                    total_tokens=(decode_max_seq_len // batch_bucket_size)
+                    - 1
+                    - num_speculative_tokens,
+                    num_computed_tokens=(decode_max_seq_len // batch_bucket_size)
+                    - 1
+                    - num_speculative_tokens,
+                    num_kv_cache_groups=num_kv_cache_groups,
+                    sampling_params=None
+                    if self.is_pooling_model
+                    else SamplingParams(temperature=0.0),
+                    pooling_params=PoolingParams(
+                        task=self.get_supported_pooling_tasks()[0]
+                    )
+                    if self.is_pooling_model
+                    else None,
+                    num_speculative_tokens=num_speculative_tokens,
                 )
-            else:
-                decode_warmup_num_reqs = [batch_bucket_size]
-
+            so, cso = self._make_dummy_scheduler_outputs(
+                dummy_decode_requests,
+                dummy_decode_num_scheduled_tokens,
+                num_kv_cache_groups,
+            )
             current_intermediate_tensors = self.decode_intermediate_tensors.get(
                 batch_bucket_size
             )
             assert current_intermediate_tensors is not None
 
-            for decode_num_reqs in decode_warmup_num_reqs:
-                for decode_spec_tokens in decode_warmup_spec_tokens:
-                    dummy_decode_requests: list[NewRequestData] = []
-                    dummy_decode_num_scheduled_tokens: dict[str, int] = {}
-                    for _ in range(decode_num_reqs):
-                        self._add_dummy_requests(
-                            requests=dummy_decode_requests,
-                            num_scheduled_tokens=dummy_decode_num_scheduled_tokens,
-                            total_tokens=(decode_max_seq_len // batch_bucket_size)
-                            - 1
-                            - decode_spec_tokens,
-                            num_computed_tokens=(decode_max_seq_len // batch_bucket_size)
-                            - 1
-                            - decode_spec_tokens,
-                            num_kv_cache_groups=num_kv_cache_groups,
-                            sampling_params=None
-                            if self.is_pooling_model
-                            else SamplingParams(temperature=0.0),
-                            pooling_params=PoolingParams(
-                                task=self.get_supported_pooling_tasks()[0]
-                            )
-                            if self.is_pooling_model
-                            else None,
-                            num_speculative_tokens=decode_spec_tokens,
-                        )
-                    so, cso = self._make_dummy_scheduler_outputs(
-                        dummy_decode_requests,
-                        dummy_decode_num_scheduled_tokens,
-                        num_kv_cache_groups,
-                    )
-                    self._execute_dummy_requests_for_warmup(
-                        so,
-                        cso,
-                        current_intermediate_tensors,
-                    )
-
-                    # Warm up speculative decode input path by populating
-                    # scheduled_spec_decode_tokens during decode.
-                    if decode_spec_tokens > 0:
-                        scheduled_spec_decode_tokens = {
-                            req.req_id: tuple(range(decode_spec_tokens))
-                            for req in dummy_decode_requests
-                        }
-                        so, cso = self._make_dummy_scheduler_outputs(
-                            dummy_decode_requests,
-                            dummy_decode_num_scheduled_tokens,
-                            num_kv_cache_groups,
-                            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-                        )
-                        self._execute_dummy_requests_for_warmup(
-                            so,
-                            cso,
-                            current_intermediate_tensors,
-                        )
-
-            # Warm up cached-request decode path for partial batches.
-            # First live batch commonly arrives as cached requests after prefill.
-            if use_extended_warmup and batch_bucket_size > 1:
-                decode_num_reqs = max(1, batch_bucket_size // 2)
-                seed_requests: list[NewRequestData] = []
-                seed_num_scheduled_tokens: dict[str, int] = {}
-                seed_total_tokens = (decode_max_seq_len // batch_bucket_size) - 1
-                for _ in range(decode_num_reqs):
-                    self._add_dummy_requests(
-                        requests=seed_requests,
-                        num_scheduled_tokens=seed_num_scheduled_tokens,
-                        total_tokens=seed_total_tokens,
-                        num_computed_tokens=seed_total_tokens,
-                        num_kv_cache_groups=num_kv_cache_groups,
-                        sampling_params=None
-                        if self.is_pooling_model
-                        else SamplingParams(temperature=0.0),
-                        pooling_params=PoolingParams(
-                            task=self.get_supported_pooling_tasks()[0]
-                        )
-                        if self.is_pooling_model
-                        else None,
-                    )
-                seed_so, _ = self._make_dummy_scheduler_outputs(
-                    seed_requests,
-                    seed_num_scheduled_tokens,
-                    num_kv_cache_groups,
-                )
-                self._execute_dummy_scheduler_output_for_warmup(
-                    seed_so,
-                    current_intermediate_tensors,
-                )
-
-                req_ids = [req.req_id for req in seed_requests]
-                cached_num_computed_tokens = [
-                    int(
-                        self.input_batch.num_tokens_no_spec[
-                            self.input_batch.req_id_to_index[req_id]
-                        ]
-                    )
-                    for req_id in req_ids
-                ]
-                cached_num_scheduled_tokens = {req_id: 1 for req_id in req_ids}
-                so, cso = self._make_dummy_cached_scheduler_outputs(
-                    req_ids=req_ids,
-                    num_scheduled_tokens=cached_num_scheduled_tokens,
-                    num_computed_tokens=cached_num_computed_tokens,
-                    num_kv_cache_groups=num_kv_cache_groups,
-                )
-                self._execute_dummy_requests_for_warmup(
+            if self.specialized_moe_decode:
+                self._execute_dummy_requests(
                     so,
                     cso,
                     current_intermediate_tensors,
+                    num_padded_tokens=self.max_num_batched_tokens,
                 )
 
-        self._warm_up_sampler()
-
-    def _warm_up_sampler(self) -> None:
-        # RBLN sampler compiles lazily on first random-sampling call.
-        # Trigger one compile here to avoid on-the-fly compile during generate.
-        if not self.use_rbln_sampler:
-            return
-
-        assert isinstance(self.sampler, RBLNSampler)
-        batch_size = self.max_num_reqs
-        vocab_size = self.input_batch.vocab_size
-        with torch.inference_mode():
-            dummy_logits = torch.empty(batch_size, vocab_size, dtype=torch.float32)
-            dummy_top_k = torch.full((batch_size,), vocab_size, dtype=torch.int32)
-            dummy_top_p = torch.full((batch_size,), 0.9, dtype=torch.float32)
-            _ = self.sampler.rbln_topk_topp_sampler(
-                dummy_logits, dummy_top_k, dummy_top_p
-            )
+            self._execute_dummy_requests(so, cso, current_intermediate_tensors)
 
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
@@ -2044,17 +1927,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         requests: list[NewRequestData],
         num_scheduled_tokens: dict[str, int],
         num_kv_cache_groups: int,
-        scheduled_spec_decode_tokens: dict[str, tuple[int, ...]] | None = None,
     ) -> tuple[SchedulerOutput, SchedulerOutput]:
-        if scheduled_spec_decode_tokens is None:
-            scheduled_spec_decode_tokens = {}
-
         sched_output = SchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[0] * num_kv_cache_groups,
             finished_req_ids=set(),
@@ -2075,104 +1954,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return sched_output, cleanup_sched_output
 
-    def _make_dummy_cached_scheduler_outputs(
-        self,
-        req_ids: list[str],
-        num_scheduled_tokens: dict[str, int],
-        num_computed_tokens: list[int],
-        num_kv_cache_groups: int,
-        scheduled_spec_decode_tokens: dict[str, tuple[int, ...]] | None = None,
-    ) -> tuple[SchedulerOutput, SchedulerOutput]:
-        if scheduled_spec_decode_tokens is None:
-            scheduled_spec_decode_tokens = {}
-
-        cached_reqs = CachedRequestData(
-            req_ids=req_ids,
-            resumed_req_ids=set(),
-            new_token_ids=[[] for _ in req_ids],
-            all_token_ids={},
-            new_block_ids=[None for _ in req_ids],
-            num_computed_tokens=num_computed_tokens,
-            num_output_tokens=[0 for _ in req_ids],
-        )
-        sched_output = SchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=cached_reqs,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[0] * num_kv_cache_groups,
-            finished_req_ids=set(),
-            free_encoder_mm_hashes=[],
-            kv_connector_metadata=None,
-        )
-        cleanup_sched_output = SchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData.make_empty(),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
-            scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[1] * num_kv_cache_groups,
-            finished_req_ids=set(req_ids),
-            free_encoder_mm_hashes=[],
-            kv_connector_metadata=None,
-        )
-        return sched_output, cleanup_sched_output
-
     def _execute_dummy_requests(
         self,
         sched_output: SchedulerOutput,
         cleanup_sched_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors,
-        num_padded_tokens: int | None = None,
-    ) -> None:
-        self._execute_dummy_scheduler_output(
-            sched_output, intermediate_tensors, num_padded_tokens
-        )
-        self._execute_dummy_scheduler_output(
-            cleanup_sched_output, intermediate_tensors, num_padded_tokens
-        )
-
-    def _execute_dummy_scheduler_output_for_warmup(
-        self,
-        sched_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors,
-    ) -> None:
-        if self.specialized_moe_decode:
-            self._execute_dummy_scheduler_output(
-                sched_output,
-                intermediate_tensors,
-                num_padded_tokens=self.max_num_batched_tokens,
-            )
-        self._execute_dummy_scheduler_output(
-            sched_output,
-            intermediate_tensors,
-        )
-
-    def _execute_dummy_requests_for_warmup(
-        self,
-        sched_output: SchedulerOutput,
-        cleanup_sched_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors,
-    ) -> None:
-        if self.specialized_moe_decode:
-            self._execute_dummy_requests(
-                sched_output,
-                cleanup_sched_output,
-                intermediate_tensors,
-                num_padded_tokens=self.max_num_batched_tokens,
-            )
-        self._execute_dummy_requests(
-            sched_output,
-            cleanup_sched_output,
-            intermediate_tensors,
-        )
-
-    def _execute_dummy_scheduler_output(
-        self,
-        sched_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors,
         num_padded_tokens: int | None = None,
     ) -> None:
@@ -2181,6 +1966,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         output = self.execute_model(
             sched_output, intermediate_tensors, num_padded_tokens
+        )
+        if output is None:
+            self.sample_tokens(None)
+        output = self.execute_model(
+            cleanup_sched_output, intermediate_tensors, num_padded_tokens
         )
         if output is None:
             self.sample_tokens(None)
