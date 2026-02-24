@@ -2984,7 +2984,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     else:  # decode
                         # During speculative decode warmup, logits indices may
                         # include padded layout offsets. Keep only the live
-                        # decode-token prefix.
+                        # decode-token rows using remapped logits indices.
                         # token_indices == None, selected = torch.tensor([0])
                         batch_indices = torch.arange(
                             self.input_batch.num_reqs, device=self.device
@@ -2994,7 +2994,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                 batch_indices,
                                 : self.speculative_config.num_speculative_tokens + 1,
                             ]
-                        logits = logits[:num_input_tokens]
+                        logits = logits[logits_indices.to(torch.int64)]
 
             if broadcast_pp_output:
                 model_output_broadcast_data = (
