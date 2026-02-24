@@ -2598,7 +2598,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             scheduler_output.num_scheduled_tokens,
         )
 
-        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+        # Decoder bucketing can produce padded sampler outputs. Bookkeeping must
+        # only touch live requests in the current batch.
+        num_reqs = len(self.input_batch.req_ids)
+        num_sampled_tokens = min(sampler_output.sampled_token_ids.shape[0], num_reqs)
         sampled_token_ids = sampler_output.sampled_token_ids
         invalid_req_indices = []
         if not self.use_async_scheduling:
@@ -2613,6 +2616,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                 )
+            if len(valid_sampled_token_ids) > num_sampled_tokens:
+                valid_sampled_token_ids = valid_sampled_token_ids[:num_sampled_tokens]
             # Mask out the sampled tokens that should not be sampled.
             for i in discard_sampled_tokens_req_indices:
                 if i < len(valid_sampled_token_ids):
@@ -2626,7 +2631,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
-            self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids[
+                :num_sampled_tokens
+            ]
             self.input_batch.prev_sampled_token_ids_invalid_indices = (
                 invalid_req_indices_set
             )
@@ -2975,9 +2982,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         # selected_token_indices == token_indices
                         logits = logits[:0] if not is_last_prefill[0] else logits
                     else:  # decode
-                        # logits_indices is for valid decode tokens,
-                        # which should be 0..num_input_tokens-1
-                        assert logits_indices[-1].item() == num_input_tokens - 1
+                        # During speculative decode warmup, logits indices may
+                        # include padded layout offsets. Keep only the live
+                        # decode-token prefix.
                         # token_indices == None, selected = torch.tensor([0])
                         batch_indices = torch.arange(
                             self.input_batch.num_reqs, device=self.device
