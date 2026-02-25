@@ -64,6 +64,35 @@ docker exec tsk-24-27 bash -lc '
 '
 ```
 
+Prefill batch with different input lengths (repeat-count stride):
+```bash
+docker exec tsk-24-27 bash -lc '
+  cd /workspace/codes/vllm-rbln && \
+  python3 examples/experimental/disaggregation/run_disagg_lmcache_smoke.py \
+    --role prefill \
+    --model meta-llama/Llama-3.2-1B \
+    --strict-lmcache \
+    --prefill-batch-size 3 \
+    --prefill-repeat-stride 2 \
+    --max-num-seqs 3
+'
+```
+
+Decode-all-requests strict smoke:
+```bash
+docker exec tsk-24-27 bash -lc '
+  cd /workspace/codes/vllm-rbln && \
+  python3 examples/experimental/disaggregation/run_disagg_lmcache_smoke.py \
+    --role both \
+    --model meta-llama/Llama-3.2-1B \
+    --strict-lmcache \
+    --require-lmcache-hit \
+    --min-lmcache-hit-tokens 1 \
+    --decode-max-tokens 8 \
+    --prefill-batch-size 2
+'
+```
+
 In strict mode, RBLN uses `RBLNLMCacheConnectorV1` (module:
 `vllm_rbln.v1.kv_connector.rbln_lmcache_connector`) to avoid adapter
 assertions when LMCache engine initialization degrades on non-CUDA devices.
@@ -85,6 +114,9 @@ Important backend note:
 - For true cross-process prefill->decode cache reuse, configure an LMCache
   backend that is shared across processes (for example remote/shared storage
   according to your LMCache deployment).
+- Decode now always processes all provided requests. On current RBLN decode
+  backend constraints, multi-request decode is executed sequentially per
+  request in the script (instead of one kernel batch) to preserve correctness.
 
 Expected success signals:
 - The script exits with code `0`.
