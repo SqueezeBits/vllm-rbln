@@ -71,4 +71,10 @@ export VLLM_RBLN_ENABLE_WARM_UP=0
 export VLLM_DISABLE_COMPILE_CACHE=1
 ```
 
-For detailed variable behavior, see the `Environment Variables` section in `vllm_rbln_torch_compile_overview.md`.
+For environment variable references, see:
+- `vllm_rbln_torch_compile_overview.md`
+- `vllm_rbln/rbln_envs.py`
+
+For feature-specific guides (structured output, automatic prefix caching,
+dynamic batching, OpenAI API serving, custom kernel), see
+`torch_compile_features.md`.
