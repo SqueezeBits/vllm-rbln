@@ -38,6 +38,7 @@ from vllm.config import KVTransferConfig
 
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
+os.environ.setdefault("RBLN_USE_CUSTOM_KERNEL", "1")
 # NOTE:
 # LMCacheConnectorV1 is auto-routed to a host fallback connector on RBLN.
 # Keep compile/warmup disabled by default for this smoke path to avoid known
@@ -134,6 +135,21 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Repeat count to produce a non-trivial prefill prompt length.",
     )
+    parser.add_argument(
+        "--prefill-batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts to process in each phase.",
+    )
+    parser.add_argument(
+        "--prefill-repeat-stride",
+        type=int,
+        default=1,
+        help=(
+            "Additional repeat count per request index. "
+            "Request i uses prompt_repeat + i * prefill_repeat_stride."
+        ),
+    )
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
     parser.add_argument("--decode-max-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=4096)
@@ -185,9 +201,97 @@ def _validate_lmcache_env(args: argparse.Namespace) -> None:
     if args.require_lmcache_hit and args.min_lmcache_hit_tokens < 1:
         raise RuntimeError("--min-lmcache-hit-tokens must be >= 1.")
 
+    if args.prefill_batch_size < 1:
+        raise RuntimeError("--prefill-batch-size must be >= 1.")
+    if args.prefill_repeat_stride < 0:
+        raise RuntimeError("--prefill-repeat-stride must be >= 0.")
+    if args.prefill_batch_size > 1 and args.prefill_repeat_stride < 1:
+        raise RuntimeError(
+            "--prefill-repeat-stride must be >= 1 when --prefill-batch-size > 1."
+        )
+    if args.max_num_seqs < 1:
+        raise RuntimeError("--max-num-seqs must be >= 1.")
 
-def _build_prompt(args: argparse.Namespace) -> str:
-    return " ".join([args.prompt] * args.prompt_repeat)
+
+def _build_repeated_prompt(prompt: str, repeat_count: int) -> str:
+    return " ".join([prompt] * repeat_count)
+
+
+def _build_prompts(args: argparse.Namespace) -> list[str]:
+    return [
+        _build_repeated_prompt(
+            prompt=args.prompt,
+            repeat_count=args.prompt_repeat + i * args.prefill_repeat_stride,
+        )
+        for i in range(args.prefill_batch_size)
+    ]
+
+
+def _decode_requires_sequential_fallback(role: str, num_prompts: int) -> bool:
+    return role == "decode" and num_prompts > 1
+
+
+def _generate_with_decode_fallback(
+    llm: LLM,
+    prompts: list[str],
+    sampling_params: SamplingParams,
+    role: str,
+) -> list[Any]:
+    # Current RBLN decode backend only supports single-request decode per step.
+    # Keep prefill batched, but process decode requests sequentially so every
+    # request is still decoded.
+    if _decode_requires_sequential_fallback(role, len(prompts)):
+        outputs = []
+        for prompt in prompts:
+            outputs.extend(llm.generate([prompt], sampling_params))
+        return outputs
+    return llm.generate(prompts, sampling_params)
+
+
+def _effective_max_num_seqs(
+    args: argparse.Namespace,
+    role: str,
+    num_prompts: int,
+) -> int:
+    # Decode fallback runs requests sequentially and must keep decode batch=1
+    # for the current RBLN naive decode custom op.
+    if _decode_requires_sequential_fallback(role, num_prompts):
+        return args.max_num_seqs
+    return max(args.max_num_seqs, num_prompts)
+
+
+def _collect_phase_outputs(role: str, outputs: list[Any]) -> dict[str, Any]:
+    if not outputs:
+        raise RuntimeError(f"{role} phase produced no outputs.")
+
+    token_counts: list[int] = []
+    output_texts: list[str] = []
+    finish_reasons: list[str | None] = []
+    for output in outputs:
+        if not output.outputs:
+            raise RuntimeError(f"{role} phase produced an empty output item.")
+        generated = output.outputs[0]
+        token_counts.append(len(generated.token_ids))
+        output_texts.append(generated.text)
+        finish_reasons.append(generated.finish_reason)
+
+    min_token_count = min(token_counts)
+    if min_token_count < 1:
+        raise RuntimeError(
+            f"{role} phase generated zero tokens in at least one request. "
+            "Disaggregation path is not healthy."
+        )
+
+    return {
+        "num_requests": len(outputs),
+        "output_token_count": min_token_count,
+        "output_token_counts": token_counts,
+        "output_text": output_texts[0],
+        "output_texts": output_texts,
+        "output_text_chars": len(output_texts[0]),
+        "finish_reason": finish_reasons[0],
+        "finish_reasons": finish_reasons,
+    }
 
 
 def _build_transfer_config(args: argparse.Namespace, role: str) -> KVTransferConfig:
@@ -211,14 +315,15 @@ def _build_transfer_config(args: argparse.Namespace, role: str) -> KVTransferCon
 def _run_phase(args: argparse.Namespace, role: str) -> dict[str, Any]:
     _validate_lmcache_env(args)
 
-    prompt = _build_prompt(args)
+    prompts = _build_prompts(args)
     max_tokens = args.prefill_max_tokens if role == "prefill" else args.decode_max_tokens
+    effective_max_num_seqs = _effective_max_num_seqs(args, role, len(prompts))
 
     llm = LLM(
         model=args.model,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=args.max_num_seqs,
+        max_num_seqs=effective_max_num_seqs,
         block_size=args.block_size,
         enable_chunked_prefill=True,
         trust_remote_code=args.trust_remote_code,
@@ -228,26 +333,16 @@ def _run_phase(args: argparse.Namespace, role: str) -> dict[str, Any]:
     )
 
     start = time.perf_counter()
-    outputs = llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=max_tokens))
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+    outputs = _generate_with_decode_fallback(llm, prompts, sampling_params, role)
     elapsed_sec = time.perf_counter() - start
 
-    if not outputs or not outputs[0].outputs:
-        raise RuntimeError(f"{role} phase produced no outputs.")
-
-    generated = outputs[0].outputs[0]
-    token_count = len(generated.token_ids)
-    if token_count < 1:
-        raise RuntimeError(
-            f"{role} phase generated zero tokens. Disaggregation path is not healthy."
-        )
-
-    result = {
+    phase_outputs = _collect_phase_outputs(role, outputs)
+    result: dict[str, Any] = {
         "phase": role,
         "elapsed_sec": elapsed_sec,
-        "output_token_count": token_count,
-        "output_text_chars": len(generated.text),
-        "finish_reason": generated.finish_reason,
     }
+    result.update(phase_outputs)
 
     del llm
     gc.collect()
@@ -287,6 +382,10 @@ def _build_subprocess_cmd(
         args.prompt,
         "--prompt-repeat",
         str(args.prompt_repeat),
+        "--prefill-batch-size",
+        str(args.prefill_batch_size),
+        "--prefill-repeat-stride",
+        str(args.prefill_repeat_stride),
         "--prefill-max-tokens",
         str(args.prefill_max_tokens),
         "--decode-max-tokens",
@@ -323,6 +422,34 @@ def _build_subprocess_cmd(
     return cmd
 
 
+def _print_subprocess_output(proc: Any) -> None:
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+
+
+def _run_subprocess_phase(
+    cmd: list[str],
+    timeout_sec: int,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=True,
+            timeout=timeout_sec,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _print_subprocess_output(exc)
+        raise
+    _print_subprocess_output(proc)
+    return proc
+
+
 def _run_both(args: argparse.Namespace) -> int:
     both_args = args
     if not args.engine_id:
@@ -342,28 +469,16 @@ def _run_both(args: argparse.Namespace) -> int:
         if both_args.lmcache_config_file:
             env["LMCACHE_CONFIG_FILE"] = both_args.lmcache_config_file
 
-        prefill_proc = subprocess.run(
-            prefill_cmd,
-            check=True,
-            timeout=both_args.phase_timeout_sec,
+        prefill_proc = _run_subprocess_phase(
+            cmd=prefill_cmd,
+            timeout_sec=both_args.phase_timeout_sec,
             env=env,
-            capture_output=True,
-            text=True,
         )
-        decode_proc = subprocess.run(
-            decode_cmd,
-            check=True,
-            timeout=both_args.phase_timeout_sec,
+        decode_proc = _run_subprocess_phase(
+            cmd=decode_cmd,
+            timeout_sec=both_args.phase_timeout_sec,
             env=env,
-            capture_output=True,
-            text=True,
         )
-
-        for proc in (prefill_proc, decode_proc):
-            if proc.stdout:
-                print(proc.stdout, end="")
-            if proc.stderr:
-                print(proc.stderr, end="", file=sys.stderr)
 
         prefill_hits = _extract_lmcache_hit_tokens(
             f"{prefill_proc.stdout}\n{prefill_proc.stderr}"
@@ -383,7 +498,7 @@ def _run_both(args: argparse.Namespace) -> int:
         summary = {
             "connector": both_args.connector,
             "engine_id": both_args.engine_id,
-            "lmcache_config_file": os.environ.get("LMCACHE_CONFIG_FILE", ""),
+            "lmcache_config_file": env.get("LMCACHE_CONFIG_FILE", ""),
             "lmcache_hit_tokens": {
                 "prefill": prefill_hits,
                 "decode": decode_hits,
@@ -398,6 +513,7 @@ def _run_both(args: argparse.Namespace) -> int:
                 "Ensure shared backend config and stable hashing "
                 "(e.g. PYTHONHASHSEED=0)."
             )
+        print(f"Decoded text (decode phase): {decode_result['output_text']}")
         print(json.dumps(summary, indent=2))
     return 0
 
