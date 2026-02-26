@@ -1138,7 +1138,19 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
-        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        is_prefill_batch = bool(self.is_prefills()[0])
+        is_ngram_decode = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "ngram"
+            and not is_prefill_batch
+        )
+        has_scheduled_spec_tokens = (
+            len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        )
+        # Keep decode on a single speculative path for ngram so that
+        # bootstrap decode (no draft token) and speculative decode share
+        # one compiled signature.
+        use_spec_decode = has_scheduled_spec_tokens or is_ngram_decode
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -1155,6 +1167,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # requests have draft tokens.
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
             num_decode_draft_tokens = np.full(num_reqs, -1, dtype=np.int32)
+            if is_ngram_decode:
+                is_decode_reqs = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    >= self.input_batch.num_prompt_tokens[:num_reqs]
+                )
+                num_decode_draft_tokens[:num_reqs] = np.where(is_decode_reqs, 0, -1)
             for (
                 req_id,
                 draft_token_ids,
@@ -1190,9 +1208,39 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Used in the below loop.
         query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs + 1]
+        query_start_loc_metadata = query_start_loc
         seq_lens = self.seq_lens.gpu[:num_reqs]
         max_seq_len = self.seq_lens.np[:num_reqs].max().item()
+        metadata_num_actual_tokens = total_num_scheduled_tokens
+        metadata_max_query_len = int(num_scheduled_tokens.max())
+
+        if is_ngram_decode:
+            assert self.speculative_config is not None
+            spec_decode_len = self.speculative_config.num_speculative_tokens + 1
+            metadata_num_actual_tokens = num_reqs * spec_decode_len
+            metadata_max_query_len = spec_decode_len
+
+            # Build padded per-request metadata to keep decode graph shape stable.
+            query_start_loc_cpu = torch.arange(
+                0,
+                metadata_num_actual_tokens + 1,
+                spec_decode_len,
+                dtype=torch.int32,
+            )
+            query_start_loc_metadata = query_start_loc_cpu.to(
+                self.device, non_blocking=True
+            )
+
+            seq_lens_np = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] + spec_decode_len
+            ).astype(np.int32, copy=False)
+            seq_lens = torch.from_numpy(seq_lens_np).to(self.device, non_blocking=True)
+            max_seq_len = int(seq_lens_np.max())
+
         spec_decode_common_attn_metadata = None
+        num_logits_indices = logits_indices.size(0)
+        if is_ngram_decode:
+            num_logits_indices = metadata_num_actual_tokens
         if use_spec_decode:
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
@@ -1200,7 +1248,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
-        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+        max_num_scheduled_tokens = metadata_max_query_len
         initial_batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
             num_reqs
         )
@@ -1210,7 +1258,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 total_num_scheduled_tokens,
                 initial_batch_bucket_size,
                 num_padded_tokens,
-                bool(self.is_prefills()[0]),
+                is_prefill_batch,
             )
         )
         assert batch_bucket_size is not None
@@ -1232,7 +1280,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     device=self.device,
                 )
                 slot_mapping = torch.zeros(
-                    (total_num_scheduled_tokens,),
+                    (metadata_num_actual_tokens,),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1240,27 +1288,27 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
+                slot_mapping = blk_table.slot_mapping.gpu[:metadata_num_actual_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 slot_mapping[
-                    total_num_scheduled_tokens:total_num_scheduled_tokens
+                    total_num_scheduled_tokens:metadata_num_actual_tokens
                 ].fill_(-1)
                 blk_table_tensor[num_reqs:total_num_scheduled_tokens].fill_(-1)
 
             common_attn_metadata = CommonAttentionMetadata(
-                query_start_loc=query_start_loc,
+                query_start_loc=query_start_loc_metadata,
                 query_start_loc_cpu=query_start_loc_cpu,
                 seq_lens=seq_lens,
                 num_reqs=num_reqs,
-                num_actual_tokens=total_num_scheduled_tokens,
+                num_actual_tokens=metadata_num_actual_tokens,
                 max_query_len=max_num_scheduled_tokens,
                 max_seq_len=max_seq_len,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
                 logits_indices_padded=logits_indices_padded,
-                num_logits_indices=logits_indices.size(0),
+                num_logits_indices=num_logits_indices,
                 causal=True,
                 encoder_seq_lens=encoder_seq_lens,
             )
@@ -1797,9 +1845,21 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         self._execute_dummy_requests(so, cso, self.prefill_intermediate_tensors)
 
+        warmup_decode_max_seq_len = self.max_model_len
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method in ("ngram", "suffix")
+        ):
+            # Warmup only needs to materialize decode/spec-decode graph families.
+            # Using max model length for synthetic ngram/suffix decode can trigger
+            # device task aborts on RBLN; cap the synthetic context length.
+            warmup_decode_max_seq_len = min(
+                self.max_model_len, self.scheduler_config.max_num_batched_tokens
+            )
+
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-            decode_max_seq_len = self.max_model_len
+            decode_max_seq_len = warmup_decode_max_seq_len
 
             dummy_decode_requests: list[NewRequestData] = []
             dummy_decode_num_scheduled_tokens: dict[str, int] = {}
@@ -1848,7 +1908,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # compile sampler for all possible decode batches
         max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
         for decode_batch in range(1, max_decode_batch + 1):
-            decode_max_seq_len = self.max_model_len
+            decode_max_seq_len = warmup_decode_max_seq_len
             dummy_decode_requests = []
             dummy_decode_num_scheduled_tokens = {}
             num_speculative_tokens = (

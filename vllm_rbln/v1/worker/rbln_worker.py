@@ -327,6 +327,20 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
             return
 
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.method == "ngram":
+            try:
+                from numba import set_num_threads
+
+                original_torch_num_threads = torch.get_num_threads()
+                set_num_threads(1)
+                torch.set_num_threads(original_torch_num_threads)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to preset numba threads before ngram warmup: %s",
+                    exc,
+                )
+
         self.model_runner.warm_up_model()
         # after completing model warm up, enable RBLN performance tracker
         self.model_runner._enable_performance_tracker()
