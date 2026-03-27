@@ -29,6 +29,7 @@ except ImportError:
     has_torch_rbln = False
 
 import torch.nn as nn
+from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -154,14 +155,15 @@ class RBLNWorker(WorkerBase):
         world_size = self.local_world_size
         env_var = current_platform.device_control_env_var
 
-        total_device_count = world_size * envs.VLLM_RBLN_TP_SIZE
+        rbln_tp_size = envs.VLLM_RBLN_TP_SIZE
+        total_device_count = world_size * rbln_tp_size
 
         if env_var not in os.environ:
             dev_begin = total_device_count * self.parallel_config.data_parallel_rank
             dev_end = dev_begin + total_device_count
             device_ids = [str(i) for i in range(dev_begin, dev_end)]
-            start_idx = self.local_rank * envs.VLLM_RBLN_TP_SIZE
-            end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+            start_idx = self.local_rank * rbln_tp_size
+            end_idx = start_idx + rbln_tp_size
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
             device_ids = os.environ[env_var].split(",")
@@ -170,8 +172,8 @@ class RBLNWorker(WorkerBase):
             )
             try:
                 device_id = int(device_ids[self.local_rank])
-                start_idx = device_id * envs.VLLM_RBLN_TP_SIZE
-                end_idx = start_idx + envs.VLLM_RBLN_TP_SIZE
+                start_idx = device_id * rbln_tp_size
+                end_idx = start_idx + rbln_tp_size
                 device_ids = [str(i) for i in range(start_idx, end_idx)]
                 selected_devices = ",".join(device_ids)
             except ValueError as e:
@@ -186,6 +188,9 @@ class RBLNWorker(WorkerBase):
             selected_devices,
         )
 
+        if has_torch_rbln and rbln_tp_size > 1:
+            os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
+
     def init_device(self) -> None:
         set_cpu_affinity(
             self.rank,
@@ -193,19 +198,14 @@ class RBLNWorker(WorkerBase):
             self.parallel_config,
         )
 
-        # Only set OMP_NUM_THREADS when TP > 1 or DP > 1
-        if (
-            self.parallel_config.tensor_parallel_size > 1
-            or self.parallel_config.data_parallel_size > 1
-        ):
-            # Use half of allocated CPUs to avoid oversubscription
-            allocated_cpus = len(os.sched_getaffinity(0))
-            num_threads = max(2, allocated_cpus // 2)
-            set_omp_num_threads(
-                self.rank,
-                self.local_rank,
-                num_threads,
-            )
+        # Use half of allocated CPUs to avoid oversubscription
+        allocated_cpus = len(os.sched_getaffinity(0))
+        num_threads = max(2, allocated_cpus // 2)
+        set_omp_num_threads(
+            self.rank,
+            self.local_rank,
+            num_threads,
+        )
 
         # NOTE(RBLN): numba is used throughout vllm code base (especially in spec-dec)
         # however accessing numba thread settings somewhat affects torch
@@ -259,31 +259,44 @@ class RBLNWorker(WorkerBase):
 
         num_runtimes = 1 + (1 + specialized_moe_decode) * decode_batch_buckets_count
 
+        ratio: float = 1.0
         if self.model_config.quantization is not None:
-            # FIXME(RBLN) - for now, mxfp4 quantization is only supported
-            assert self.model_config.quantization == "mxfp4"
-            if "ca" in device_name:
-                # ATOM DOES NOT support mxfp4 quantization, handled by bf16
-                nbits_per_param = 16
-                # mlp weight scale is merged into params
-                # FIXME(RBLN) - expert scale merged into expert weight param
-                # ratio scale vs weight = 1 : 16
-                ratio = 16 / 17
-            elif "cr" in device_name:
-                # REBEL can support mxfp4 quantization
-                nbits_per_param = 4
-                ratio = 1
+            logger.info(
+                "model quantization scheme = %s", self.model_config.quantization
+            )
+            # FIXME(RBLN) - for now, mxfp4/fp8 quantization is only supported
+            quantization = self.model_config.quantization
+            assert quantization == "mxfp4" or quantization == "fp8"
+
+            if quantization == "fp8":
+                nbits_per_param = 8
+                packed_num_elems = 1
+            elif quantization == "mxfp4":
+                if "ca" in device_name:
+                    # ATOM DOES NOT support mxfp4 quantization, handled by bf16
+                    nbits_per_param = 16
+                    # mlp weight scale is merged into params
+                    # FIXME(RBLN) - expert scale merged into expert weight param
+                    # ratio scale vs weight = 1 : 16
+                    ratio = 16 / 17
+                elif "cr" in device_name:
+                    # REBEL can support mxfp4 quantization
+                    nbits_per_param = 4
+                else:
+                    raise ValueError(
+                        "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                    )
+                # pack 2 mxfp4 elems into single uint8 elem
+                packed_num_elems = 8 // 4
             else:
                 raise ValueError(
-                    "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                    "invalid quantization scheme, candidates = [fp8, mxfp4]"
                 )
 
-            # pack 2 mxfp4 elems into single uint8 elem
-            packed_num_elems = 8 // 4
         else:
             nbits_per_param = 16
             packed_num_elems = 1
-            ratio = 1
+
         for key, value in params_dict.items():
             if value.dtype == torch.bfloat16:
                 n_model_attentions += value.numel()
@@ -342,7 +355,31 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
             return
 
-        self.model_runner.warm_up_model()
+        try:
+            self.model_runner.warm_up_model()
+
+        except BackendCompilerFailed as e:
+
+            def is_oom(exc):
+                if isinstance(exc, RuntimeError):
+                    for arg in exc.args:
+                        if isinstance(arg, str) and (
+                            "SYS_ENOMEM: Out of memory" in arg
+                            or "SYS_EBUSY: Lack of device memory" in arg
+                        ):
+                            return True
+                return False
+
+            if is_oom(e.inner_exception):
+                raise RuntimeError(
+                    "Not enough memory for "
+                    f"{self.model_runner.kv_cache_config.num_blocks} "
+                    "blocks of KV cache. Try reducing the number of blocks "
+                    "by setting --num-gpu-blocks-override."
+                ) from e
+
+            raise
+
         # after completing model warm up, enable RBLN performance tracker
         self.model_runner._enable_performance_tracker()
 
@@ -442,6 +479,8 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+            if self.model_runner.e2e_performance_tracker:
+                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(
