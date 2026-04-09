@@ -14,18 +14,29 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copied from https://github.com/vllm-project/vllm/blob/v0.12.0/tests/v1/core/utils.py
+# Copied from https://github.com/vllm-project/vllm/blob/v0.18.0/tests/v1/core/utils.py
 # Search for NOTE(RBLN) or TODO(RBLN) for changes
 
+
+from dataclasses import dataclass
+from itertools import chain
 
 import torch
 from vllm.config import (
     CacheConfig,
-    ECTransferConfig,  # KVTransferConfig,
+    # ECTransferConfig,
+    KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
+)
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
 )
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -34,6 +45,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -51,6 +63,93 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
 EOS_TOKEN_ID = 50256
 
 
+# ---------------------------------------------------------------------------
+# Mock KV Connector for testing sub-block ↔ connector interaction
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MockKVConfig:
+    """Config for MockKVConnector: how many tokens to report as externally
+    cached, and whether loading is async."""
+
+    matched_tokens: int = 0
+    is_async: bool = False
+
+
+class _MockKVConnectorMetadata(KVConnectorMetadata):
+    def __init__(self):
+        self.requests: list = []
+
+
+class MockKVConnector(KVConnectorBase_V1):
+    """Minimal mock KV connector for scheduler tests.
+
+    Returns ``config.matched_tokens`` as external tokens only for requests
+    whose ``kv_transfer_params`` contain ``do_remote_prefill=True``.
+    Other requests get 0 external tokens.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        extra = self._kv_transfer_config.kv_connector_extra_config
+        self.config = MockKVConfig(
+            matched_tokens=extra["matched_tokens"],
+            is_async=extra["is_async"],
+        )
+
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        params = getattr(request, "kv_transfer_params", None)
+        if params and params.get("do_remote_prefill"):
+            return (self.config.matched_tokens, self.config.is_async)
+        return (0, False)
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        pass
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        metadata = _MockKVConnectorMetadata()
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id in chain(
+            (req.req_id for req in scheduler_output.scheduled_new_reqs),
+            (
+                req_id
+                for req_id in cached_reqs.req_ids
+                if req_id in cached_reqs.resumed_req_ids
+            ),
+        ):
+            metadata.requests.append({"req_id": req_id})
+        return metadata
+
+    def start_load_kv(self, forward_context, **kwargs):
+        pass
+
+    def wait_for_layer_load(self, layer_name):
+        pass
+
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+        pass
+
+    def wait_for_save(self):
+        pass
+
+
+KVConnectorFactory.register_connector(
+    "MockKVConnector", __name__, MockKVConnector.__name__
+)
+
+
 def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
@@ -59,15 +158,17 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     disable_chunked_mm_input: bool = False,
-    use_kv_connector: None | bool = None,
+    use_kv_connector: None | MockKVConfig = None,
     num_blocks: int = 10000,
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
+    pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    sub_block_size: int | None = None,
 ) -> RBLNScheduler:
     """Create scheduler under test.
 
@@ -85,8 +186,6 @@ def create_scheduler(
 
     # TODO(RBLN): support async scheduling
     assert not async_scheduling
-    # TODO(RBLN): support kv transfer via kv connector
-    assert not use_kv_connector
     # TODO(RBLN): support specluative decoding
     assert not num_speculative_tokens
 
@@ -113,28 +212,19 @@ def create_scheduler(
     cache_config = CacheConfig(
         block_size=block_size,
         gpu_memory_utilization=0.9,
-        swap_space=0,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
     kv_transfer_config = None
-    # if isinstance(use_kv_connector, MockKVConfig):
-    #     kv_transfer_config = KVTransferConfig(
-    #         kv_connector="MockKVConnector",
-    #         kv_role="kv_both",
-    #         kv_connector_extra_config={
-    #             "matched_tokens": use_kv_connector.matched_tokens,
-    #             "is_async": use_kv_connector.is_async,
-    #         },
-    #     )
-    # elif use_kv_connector:
-    #     kv_transfer_config = KVTransferConfig(
-    #         kv_connector="SharedStorageConnector",
-    #         kv_role="kv_both",
-    #         kv_connector_extra_config={
-    #             "shared_storage_path": "local_storage"
-    #         },
-    #     )
+    if isinstance(use_kv_connector, MockKVConfig):
+        kv_transfer_config = KVTransferConfig(
+            kv_connector="MockKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "matched_tokens": use_kv_connector.matched_tokens,
+                "is_async": use_kv_connector.is_async,
+            },
+        )
 
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
@@ -142,20 +232,22 @@ def create_scheduler(
             model="ngram", num_speculative_tokens=num_speculative_tokens
         )
 
-    ec_transfer_config = (
-        ECTransferConfig(
-            ec_connector="ECSharedStorageConnector",
-            ec_role=ec_role,
-            ec_connector_extra_config={"shared_storage_path": "/tmp/ec_test"},
-        )
-        if use_ec_connector
-        else None
-    )
+    ec_transfer_config = None
+    # ec_transfer_config = (
+    #     ECTransferConfig(
+    #         ec_connector="ECExampleConnector",
+    #         ec_role=ec_role,
+    #         ec_connector_extra_config={"shared_storage_path": "/tmp/ec_test"},
+    #     )
+    #     if use_ec_connector
+    #     else None
+    # )
 
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
+        parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
@@ -165,13 +257,18 @@ def create_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(block_size, 1, 1, torch.float32, False)
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
             )
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
-    # TODO(RBLN): support async scheduling
-    # scheduler_cls = AsyncScheduler if async_scheduling else RBLNScheduler
+    # scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
     scheduler_cls = RBLNScheduler
     return scheduler_cls(
         vllm_config=vllm_config,
@@ -179,6 +276,7 @@ def create_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
+        sub_block_size=sub_block_size,
     )
 
 
@@ -190,6 +288,7 @@ def create_requests(
     num_tokens: int = 10,
     mm_hashes_list: list[list[str]] | None = None,
     mm_positions: list[list[PlaceholderRange]] | None = None,
+    ignore_eos: bool = False,
     max_tokens: int = 16,
     stop_token_ids: list[int] | None = None,
     prompt_logprobs: int | None = None,
@@ -208,17 +307,17 @@ def create_requests(
 
     block_hasher = get_request_block_hasher(block_size, sha256)
     sampling_params = SamplingParams(
-        ignore_eos=False,
+        ignore_eos=ignore_eos,
         max_tokens=max_tokens,
         stop_token_ids=stop_token_ids,
         prompt_logprobs=prompt_logprobs,
     )
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
     requests = []
 
     if mm_hashes_list is not None:
         # NOTE: allow manual input; some mm items can have the same identifier
-        # no. of mm_hashes and mm_positions for each request should be
-        # identical
+        # no. of mm_hashes and mm_positions for each request should be identical
         assert mm_positions is not None, (
             "mm_positions must be provided when mm_hashes_list is provided"
         )
@@ -226,8 +325,7 @@ def create_requests(
         assert [len(h) for h in mm_hashes_list] == [len(p) for p in mm_positions]
 
         # Since same identifier would imply they are identical encoder output
-        # Verify mm items with identical identifier are having
-        # mm_position.length
+        # Verify mm items with identical identifier are having mm_position.length
         seen_hashes: dict[str, int] = {}
 
     if req_ids:
@@ -248,9 +346,9 @@ def create_requests(
                 position_length = position.length
                 if identifier in seen_hashes:
                     assert seen_hashes[identifier] == position_length, (
-                        f"mm_hash '{identifier}' has inconsistent position "
-                        f"lengths: previously {seen_hashes[identifier]}, now "
-                        f"{position_length} at request {i}, position {j}"
+                        f"mm_hash '{identifier}' has inconsistent position lengths: "
+                        f"previously {seen_hashes[identifier]}, now {position_length} "
+                        f"at request {i}, position {j}"
                     )
                 else:
                     seen_hashes[identifier] = position_length
@@ -258,7 +356,7 @@ def create_requests(
                 # Unique dummy hash for each mm item
                 identifier = f"hash{i}_{j}"
             mm_feature = MultiModalFeatureSpec(
-                data=MultiModalKwargsItem.dummy("dummy_m"),
+                data=MultiModalKwargsItem.dummy(),
                 mm_position=position,
                 identifier=identifier,
                 modality="image",
@@ -272,7 +370,6 @@ def create_requests(
             sampling_params=sampling_params,
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
-            eos_token_id=EOS_TOKEN_ID,
             block_hasher=block_hasher,
         )
         requests.append(request)

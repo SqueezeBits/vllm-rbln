@@ -12,26 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import torch
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.selector import AttentionSelectorConfig
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import AttentionSelectorConfig
 
 
 def test_platform_plugins():
     import runpy
 
-    current_file = __file__
-    import os
-
-    example_file = os.path.join(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(current_file)))
-        ),
-        "examples",
-        "experimental/offline_inference_basic.py",
+    repo_root = Path(__file__).resolve().parents[3]
+    example_file = (
+        repo_root / "examples" / "experimental" / "offline_inference_basic.py"
     )
-    runpy.run_path(example_file)
+    runpy.run_path(str(example_file))
 
     # check if the plugin is loaded correctly
     from vllm.platforms import _init_trace, current_platform
@@ -48,9 +44,9 @@ def test_register_ops(vllm_config):
 
     with set_current_vllm_config(vllm_config):
         # Attention
-        from vllm.attention.layer import Attention
+        from vllm.model_executor.layers.attention.attention import Attention
 
-        attention = Attention(16, 32, 16, 16, prefix="layer.0")
+        attention = Attention(16, 32, 0.125, 16, prefix="layer.0")
         assert hasattr(attention, "layer_index"), (
             f"Expected 'layer_index' in attention.__dict__, got {attention.__dict__}"
         )

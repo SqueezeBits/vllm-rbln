@@ -15,6 +15,7 @@
 
 import copy
 import os
+import time
 from types import NoneType
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,7 @@ except ImportError:
 
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -39,10 +40,10 @@ from vllm.distributed import (
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.request import LoRARequest
-from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -217,7 +218,8 @@ class RBLNWorker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
     def load_model(self):
-        self.model_runner.load_model()
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -360,7 +362,8 @@ class RBLNWorker(WorkerBase):
         )
         self._rbln_cpu_affinity_applied = True
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> float:
+        st = time.perf_counter()
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
                 max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -387,36 +390,38 @@ class RBLNWorker(WorkerBase):
             logger.warning("skipping compile_or_warm_up_model")
 
             self._ensure_rbln_cpu_affinity_after_warmup()
-            return
+            return time.perf_counter() - st
+        else:
+            try:
+                self.model_runner.warm_up_model()
 
-        try:
-            self.model_runner.warm_up_model()
+            except BackendCompilerFailed as e:
 
-        except BackendCompilerFailed as e:
+                def is_oom(exc):
+                    if isinstance(exc, RuntimeError):
+                        for arg in exc.args:
+                            if isinstance(arg, str) and (
+                                "SYS_ENOMEM: Out of memory" in arg
+                                or "SYS_EBUSY: Lack of device memory" in arg
+                            ):
+                                return True
+                    return False
 
-            def is_oom(exc):
-                if isinstance(exc, RuntimeError):
-                    for arg in exc.args:
-                        if isinstance(arg, str) and (
-                            "SYS_ENOMEM: Out of memory" in arg
-                            or "SYS_EBUSY: Lack of device memory" in arg
-                        ):
-                            return True
-                return False
+                if is_oom(e.inner_exception):
+                    raise RuntimeError(
+                        "Not enough memory for "
+                        f"{self.model_runner.kv_cache_config.num_blocks} "
+                        "blocks of KV cache. Try reducing the number of blocks "
+                        "by setting --num-gpu-blocks-override."
+                    ) from e
 
-            if is_oom(e.inner_exception):
-                raise RuntimeError(
-                    "Not enough memory for "
-                    f"{self.model_runner.kv_cache_config.num_blocks} "
-                    "blocks of KV cache. Try reducing the number of blocks "
-                    "by setting --num-gpu-blocks-override."
-                ) from e
-
-            raise
+                raise
 
         # After warm-up: apply CPU affinity only (threads already set pre-compile).
         self._ensure_rbln_cpu_affinity_after_warmup()
         self.model_runner._enable_performance_tracker()
+
+        return time.perf_counter() - st
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
