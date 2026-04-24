@@ -41,8 +41,12 @@ def test_base_manager_properties_and_find():
 
 def test_base_manager_find_decode_bucket_not_found():
     manager = DummyManager(max_batch_size=8)
-    with pytest.raises(ValueError, match="No batch bucket found"):
+    with pytest.raises(ValueError) as exc_info:
         manager.find_decode_batch_bucket(9)
+
+    assert str(exc_info.value) == (
+        "No batch bucket found for batch size 9, batch buckets: [1, 2, 4, 8]"
+    )
 
 
 def test_base_manager_abstract_method_not_defined():
@@ -203,5 +207,5 @@ def test_get_bucketing_manager_for_all_strategies():
 
 
 def test_get_bucketing_manager_rejects_invalid_strategy():
-    with pytest.raises(ValueError, match="Invalid bucketing strategy"):
+    with pytest.raises(ValueError, match="Invalid bucketing strategy: unknown"):
         get_bucketing_manager("unknown", max_batch_size=8)

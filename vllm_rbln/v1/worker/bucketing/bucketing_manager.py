@@ -57,9 +57,8 @@ class RBLNBucketingManager(ABC):
             if bucket >= batch_size:
                 return bucket
         raise ValueError(
-            "No batch bucket found for batch size %d, batch buckets: %s",
-            batch_size,
-            self.batch_buckets,
+            "No batch bucket found for "
+            f"batch size {batch_size}, batch buckets: {self.batch_buckets}",
         )
 
     @staticmethod
