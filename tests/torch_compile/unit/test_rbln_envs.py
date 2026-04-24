@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 import vllm_rbln.rbln_envs as rbln_envs
 
 
@@ -96,3 +98,20 @@ def test_rbln_envs():
         f"Expected VLLM_RBLN_AUTO_PORT to be False, \
         got {rbln_envs.VLLM_RBLN_AUTO_PORT}"
     )
+
+
+def test_get_decode_batch_bucket_strategy_canonicalizes_exp(monkeypatch):
+    monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exp")
+
+    assert rbln_envs.get_decode_batch_bucket_strategy() == "exponential"
+
+
+def test_get_decode_batch_bucket_strategy_requires_manual_buckets(monkeypatch):
+    monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "manual")
+    monkeypatch.delenv("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match="There must be at least one decode batch size in the manual buckets",
+    ):
+        rbln_envs.get_decode_batch_bucket_strategy()
