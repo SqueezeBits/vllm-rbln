@@ -17,7 +17,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def reset_patch_registry_state(monkeypatch):
-    import vllm_rbln.patch_registry as patch_registry
+    import vllm_rbln.patches.patch_registry as patch_registry
 
     monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
     monkeypatch.setattr(patch_registry, "_general_extensions_loaded", False)
@@ -25,7 +25,7 @@ def reset_patch_registry_state(monkeypatch):
 
 
 def _build_descriptor(*, key: str, owner_module: str):
-    from vllm_rbln.patch_registry import PatchDescriptor
+    from vllm_rbln.patches.patch_registry import PatchDescriptor
 
     return PatchDescriptor(
         key=key,
@@ -37,7 +37,7 @@ def _build_descriptor(*, key: str, owner_module: str):
 
 
 def test_patch_registry_splits_general_extensions_from_legacy_patches():
-    from vllm_rbln.patch_registry import (
+    from vllm_rbln.patches.patch_registry import (
         get_general_extension_modules,
         get_legacy_patch_modules,
     )
@@ -53,7 +53,10 @@ def test_patch_registry_splits_general_extensions_from_legacy_patches():
 
 
 def test_apply_patch_descriptors_is_idempotent():
-    from vllm_rbln.patch_registry import PatchDescriptor, apply_patch_descriptors
+    from vllm_rbln.patches.patch_registry import (
+        PatchDescriptor,
+        apply_patch_descriptors,
+    )
 
     applied: list[str] = []
 
@@ -141,7 +144,7 @@ def test_validate_registry_layout_rejects_invalid_configs(
     descriptors,
     message,
 ):
-    import vllm_rbln.patch_registry as patch_registry
+    import vllm_rbln.patches.patch_registry as patch_registry
 
     monkeypatch.setattr(
         patch_registry, "_GENERAL_EXTENSION_MODULES", general_extensions
@@ -154,8 +157,11 @@ def test_validate_registry_layout_rejects_invalid_configs(
 
 
 def test_apply_patch_descriptors_runs_verify_once(monkeypatch):
-    import vllm_rbln.patch_registry as patch_registry
-    from vllm_rbln.patch_registry import PatchDescriptor, apply_patch_descriptors
+    import vllm_rbln.patches.patch_registry as patch_registry
+    from vllm_rbln.patches.patch_registry import (
+        PatchDescriptor,
+        apply_patch_descriptors,
+    )
 
     monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
 
@@ -176,7 +182,7 @@ def test_apply_patch_descriptors_runs_verify_once(monkeypatch):
 
 
 def test_register_general_extensions_imports_only_once(monkeypatch):
-    import vllm_rbln.patch_registry as patch_registry
+    import vllm_rbln.patches.patch_registry as patch_registry
 
     imported: list[tuple[str, ...]] = []
     modules = ("general.one", "general.two")
@@ -185,7 +191,7 @@ def test_register_general_extensions_imports_only_once(monkeypatch):
     monkeypatch.setattr(
         patch_registry,
         "_import_modules",
-        lambda module_names: imported.append(tuple(module_names)),
+        lambda module_names, *, kind: imported.append(tuple(module_names)),
     )
 
     patch_registry.register_general_extensions()
@@ -195,7 +201,7 @@ def test_register_general_extensions_imports_only_once(monkeypatch):
 
 
 def test_import_legacy_patch_modules_imports_only_once(monkeypatch):
-    import vllm_rbln.patch_registry as patch_registry
+    import vllm_rbln.patches.patch_registry as patch_registry
 
     imported: list[tuple[str, ...]] = []
     modules = ("legacy.one", "legacy.two")
@@ -204,10 +210,102 @@ def test_import_legacy_patch_modules_imports_only_once(monkeypatch):
     monkeypatch.setattr(
         patch_registry,
         "_import_modules",
-        lambda module_names: imported.append(tuple(module_names)),
+        lambda module_names, *, kind: imported.append(tuple(module_names)),
     )
 
     patch_registry.import_legacy_patch_modules()
     patch_registry.import_legacy_patch_modules()
 
     assert imported == [modules]
+
+
+def test_apply_patch_descriptors_logs_when_patch_is_enabled(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
+    from vllm_rbln.patches.patch_registry import (
+        PatchDescriptor,
+        apply_patch_descriptors,
+    )
+
+    monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
+
+    debug_calls: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        patch_registry.logger,
+        "debug",
+        lambda message, *args: debug_calls.append((message, args)),
+    )
+
+    descriptor = PatchDescriptor(
+        key="test.patch_registry.logging",
+        owner_module="tests.patch_registry.logging",
+        targets=("vllm.fake.symbol",),
+        reason="test descriptor",
+        apply=lambda: None,
+    )
+
+    apply_patch_descriptors((descriptor,))
+
+    assert debug_calls == [
+        (
+            "Enabling registry-managed patch %s (owner=%s, targets=%s)",
+            (
+                "test.patch_registry.logging",
+                "tests.patch_registry.logging",
+                "vllm.fake.symbol",
+            ),
+        )
+    ]
+
+
+def test_register_general_extensions_logs_when_modules_are_loaded(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
+
+    modules = ("general.one", "general.two")
+    debug_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    monkeypatch.setattr(patch_registry, "_GENERAL_EXTENSION_MODULES", modules)
+    monkeypatch.setattr(
+        patch_registry,
+        "_general_extensions_loaded",
+        False,
+    )
+    monkeypatch.setattr(patch_registry, "import_module", lambda module_name: None)
+    monkeypatch.setattr(
+        patch_registry.logger,
+        "debug",
+        lambda message, *args: debug_calls.append((message, args)),
+    )
+
+    patch_registry.register_general_extensions()
+
+    assert debug_calls == [
+        ("Enabling %s via module import: %s", ("general extension", "general.one")),
+        ("Enabling %s via module import: %s", ("general extension", "general.two")),
+    ]
+
+
+def test_import_legacy_patch_modules_logs_when_modules_are_loaded(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
+
+    modules = ("legacy.one", "legacy.two")
+    debug_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    monkeypatch.setattr(patch_registry, "_LEGACY_PATCH_MODULES", modules)
+    monkeypatch.setattr(
+        patch_registry,
+        "_legacy_patch_modules_loaded",
+        False,
+    )
+    monkeypatch.setattr(patch_registry, "import_module", lambda module_name: None)
+    monkeypatch.setattr(
+        patch_registry.logger,
+        "debug",
+        lambda message, *args: debug_calls.append((message, args)),
+    )
+
+    patch_registry.import_legacy_patch_modules()
+
+    assert debug_calls == [
+        ("Enabling %s via module import: %s", ("legacy patch", "legacy.one")),
+        ("Enabling %s via module import: %s", ("legacy patch", "legacy.two")),
+    ]

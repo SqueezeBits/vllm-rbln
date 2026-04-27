@@ -16,6 +16,10 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 
+from vllm_rbln.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @dataclass(frozen=True)
 class PatchDescriptor:
@@ -79,8 +83,9 @@ _general_extensions_loaded = False
 _legacy_patch_modules_loaded = False
 
 
-def _import_modules(module_names: Iterable[str]) -> None:
+def _import_modules(module_names: Iterable[str], *, kind: str) -> None:
     for module_name in module_names:
+        logger.debug("Enabling %s via module import: %s", kind, module_name)
         import_module(module_name)
 
 
@@ -143,7 +148,7 @@ def register_general_extensions() -> None:
     if _general_extensions_loaded:
         return
 
-    _import_modules(_GENERAL_EXTENSION_MODULES)
+    _import_modules(_GENERAL_EXTENSION_MODULES, kind="general extension")
     _general_extensions_loaded = True
 
 
@@ -152,6 +157,12 @@ def apply_patch_descriptors(descriptors: Sequence[PatchDescriptor]) -> None:
         if descriptor.key in _applied_patch_keys:
             continue
 
+        logger.debug(
+            "Enabling registry-managed patch %s (owner=%s, targets=%s)",
+            descriptor.key,
+            descriptor.owner_module,
+            ", ".join(descriptor.targets),
+        )
         descriptor.apply()
         if descriptor.verify is not None:
             descriptor.verify()
@@ -168,7 +179,7 @@ def import_legacy_patch_modules() -> None:
     if _legacy_patch_modules_loaded:
         return
 
-    _import_modules(_LEGACY_PATCH_MODULES)
+    _import_modules(_LEGACY_PATCH_MODULES, kind="legacy patch")
     _legacy_patch_modules_loaded = True
 
 
