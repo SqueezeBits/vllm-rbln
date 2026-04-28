@@ -29,6 +29,7 @@ from . import (
     logits_processor,  # noqa: F401
     lora,  # noqa: F401
     models_qwen2,  # noqa: F401
+    models_qwen3,  # noqa: F401
     models_utils,  # noqa: F401
     rotary_embedding,  # noqa: F401
     vocab_parallel_embedding,  # noqa: F401
