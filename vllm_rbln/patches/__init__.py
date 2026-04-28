@@ -27,6 +27,7 @@ from vllm_rbln.patches.patch_registry import (
 from . import (
     logits_processor,  # noqa: F401
     lora,  # noqa: F401
+    vocab_parallel_embedding,  # noqa: F401
 )
 
 __all__ = (

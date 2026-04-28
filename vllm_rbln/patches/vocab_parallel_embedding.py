@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 from vllm.distributed import (
     divide,
@@ -33,8 +32,25 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     pad_vocab_size,
 )
 
+from vllm_rbln.patches.patch_registry import register_patch
 
-def __vocab_parallel_embedding__init__(
+# NOTE(RBLN): This patch originated from
+# https://github.com/RBLN-SW/vllm-rbln/pull/81 while enabling vLLM MoE models
+# execution on RBLN.
+# TODO(RBLN): Revisit whether the current patch reasons describe that origin
+# and constraint accurately enough.
+
+
+@register_patch(
+    target="vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding.__init__",
+    reason=(
+        "The RBLN path needs token embeddings to stay replicated while "
+        "keeping ParallelLMHead tensor-parallel sharded, because the "
+        "upstream implementation assumes every vocab-parallel tensor "
+        "follows the same TP-sharded padded-vocabulary layout."
+    ),
+)
+def vocab_parallel_embedding_init(
     self,
     num_embeddings: int,
     embedding_dim: int,
@@ -120,7 +136,16 @@ def __vocab_parallel_embedding__init__(
     )
 
 
-def __vocab_parallel_embedding_forward(self, input_):
+@register_patch(
+    target="vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding.forward",
+    reason=(
+        "The RBLN path needs regular token embedding lookups to bypass the "
+        "upstream forward_native sharded-reduction path, while preserving "
+        "masking and all-reduce only for layers that remain "
+        "tensor-parallel sharded."
+    ),
+)
+def vocab_parallel_embedding_forward(self, input_):
     if self.tp_size > 1:
         # Build the mask.
         masked_input, input_mask = get_masked_input_and_mask(
@@ -145,17 +170,19 @@ def __vocab_parallel_embedding_forward(self, input_):
     return output
 
 
-def __parallel_lm_head_tie_weights(self, embed_tokens: VocabParallelEmbedding):
+@register_patch(
+    target="vllm.model_executor.layers.vocab_parallel_embedding.ParallelLMHead.tie_weights",
+    reason=(
+        "The RBLN path needs to avoid tying a tensor-parallel-sharded LM "
+        "head directly to replicated token embeddings, while preserving "
+        "the single-rank and GGUF cases."
+    ),
+)
+def parallel_lm_head_tie_weights(self, embed_tokens: VocabParallelEmbedding):
     """Tie the weights with word embeddings."""
     # GGUF quantized embed_tokens.
     if self.quant_config and self.quant_config.get_name() == "gguf":
         return embed_tokens
-    else:
-        if self.tp_size < 2:
-            self.weight = embed_tokens.weight
-        return self
-
-
-VocabParallelEmbedding.__init__ = __vocab_parallel_embedding__init__
-VocabParallelEmbedding.forward = __vocab_parallel_embedding_forward
-ParallelLMHead.tie_weights = __parallel_lm_head_tie_weights
+    if self.tp_size < 2:
+        self.weight = embed_tokens.weight
+    return self
