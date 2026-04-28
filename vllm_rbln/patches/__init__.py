@@ -21,7 +21,10 @@ from vllm_rbln.patches.patch_registry import (
     get_registered_patch_descriptors,
     import_legacy_patch_modules,
     register_general_extensions,
+    register_patch,
 )
+
+from . import lora  # noqa: F401
 
 __all__ = (
     "PatchDescriptor",
@@ -32,4 +35,5 @@ __all__ = (
     "get_registered_patch_descriptors",
     "import_legacy_patch_modules",
     "register_general_extensions",
+    "register_patch",
 )

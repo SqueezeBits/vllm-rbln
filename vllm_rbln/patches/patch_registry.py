@@ -15,6 +15,7 @@
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+from typing import Any
 
 from vllm_rbln.logger import init_logger
 
@@ -25,13 +26,52 @@ logger = init_logger(__name__)
 class PatchDescriptor:
     key: str
     owner_module: str
-    targets: tuple[str, ...]
+    target: str
+    replacement: Any
     reason: str
-    apply: Callable[[], None]
-    assumptions: tuple[str, ...] = ()
-    contract_tests: tuple[str, ...] = ()
+    condition: Callable[[], bool] | None = None
     verify: Callable[[], None] | None = None
     order_hint: int = 0
+
+
+_REGISTERED_PATCH_DESCRIPTORS: list[PatchDescriptor] = []
+
+
+def register_patch(
+    *,
+    target: str,
+    reason: str,
+    key: str | None = None,
+    condition: Callable[[], bool] | None = None,
+    verify: Callable[[], None] | None = None,
+    order_hint: int = 0,
+) -> Callable[[Any], Any]:
+    def _decorator(replacement: Any) -> Any:
+        replacement_name = getattr(
+            replacement,
+            "__qualname__",
+            replacement.__name__,
+        )
+        descriptor_key = key or (f"{replacement.__module__}.{replacement_name}")
+        for descriptor in _REGISTERED_PATCH_DESCRIPTORS:
+            if descriptor.key == descriptor_key:
+                return replacement
+
+        _REGISTERED_PATCH_DESCRIPTORS.append(
+            PatchDescriptor(
+                key=descriptor_key,
+                owner_module=replacement.__module__,
+                target=target,
+                replacement=replacement,
+                reason=reason,
+                condition=condition,
+                verify=verify,
+                order_hint=order_hint,
+            )
+        )
+        return replacement
+
+    return _decorator
 
 
 # NOTE: These modules are part of bootstrap/registration, not upstream symbol
@@ -52,7 +92,6 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
 _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.model_executor.layers.attention.attention",
     "vllm_rbln.forward_context",
-    "vllm_rbln.lora.layer",
     "vllm_rbln.model_executor.layers.fused_moe.layer",
     "vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe",
     "vllm_rbln.model_executor.layers.logits_processor",
@@ -73,11 +112,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.models.utils",
 )
 
-
-# NOTE: The bridge registry starts empty. Patch clusters will move here
-# incrementally from `_LEGACY_PATCH_MODULES`.
-_REGISTERED_PATCH_DESCRIPTORS: tuple[PatchDescriptor, ...] = ()
-
 _applied_patch_keys: set[str] = set()
 _general_extensions_loaded = False
 _legacy_patch_modules_loaded = False
@@ -95,6 +129,36 @@ def _sort_patch_descriptors(
     return tuple(sorted(descriptors, key=lambda d: (d.order_hint, d.key)))
 
 
+def _resolve_patch_target_owner(target: str) -> tuple[object, str]:
+    parts = target.split(".")
+    for module_end in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:module_end])
+        try:
+            owner = import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+
+        attr_parts = parts[module_end:]
+        for attr in attr_parts[:-1]:
+            owner = getattr(owner, attr)
+        return owner, attr_parts[-1]
+
+    msg = f"unable to resolve patch target: {target}"
+    raise ValueError(msg)
+
+
+def _apply_target_patch(descriptor: PatchDescriptor) -> None:
+    owner, attr = _resolve_patch_target_owner(descriptor.target)
+    setattr(owner, attr, descriptor.replacement)
+
+
+def _verify_target_patch(descriptor: PatchDescriptor) -> None:
+    owner, attr = _resolve_patch_target_owner(descriptor.target)
+    if getattr(owner, attr) is not descriptor.replacement:
+        msg = f"failed to patch target: {descriptor.target}"
+        raise RuntimeError(msg)
+
+
 def _validate_registry_layout() -> None:
     general_extensions = set(_GENERAL_EXTENSION_MODULES)
     legacy_patches = set(_LEGACY_PATCH_MODULES)
@@ -103,17 +167,17 @@ def _validate_registry_layout() -> None:
         raise ValueError(msg)
 
     descriptor_keys: set[str] = set()
-    descriptor_owner_modules: set[str] = set()
+    descriptor_targets: set[str] = set()
     for descriptor in _REGISTERED_PATCH_DESCRIPTORS:
         if descriptor.key in descriptor_keys:
             msg = f"duplicate patch descriptor key: {descriptor.key}"
             raise ValueError(msg)
         descriptor_keys.add(descriptor.key)
 
-        if descriptor.owner_module in descriptor_owner_modules:
-            msg = f"duplicate patch descriptor owner module: {descriptor.owner_module}"
+        if descriptor.target in descriptor_targets:
+            msg = f"duplicate patch descriptor target: {descriptor.target}"
             raise ValueError(msg)
-        descriptor_owner_modules.add(descriptor.owner_module)
+        descriptor_targets.add(descriptor.target)
 
         if descriptor.owner_module in general_extensions:
             msg = (
@@ -139,6 +203,7 @@ def get_legacy_patch_modules() -> tuple[str, ...]:
 
 
 def get_registered_patch_descriptors() -> tuple[PatchDescriptor, ...]:
+    _validate_registry_layout()
     return _sort_patch_descriptors(_REGISTERED_PATCH_DESCRIPTORS)
 
 
@@ -157,15 +222,20 @@ def apply_patch_descriptors(descriptors: Sequence[PatchDescriptor]) -> None:
         if descriptor.key in _applied_patch_keys:
             continue
 
+        if descriptor.condition is not None and not descriptor.condition():
+            continue
+
         logger.debug(
-            "Enabling registry-managed patch %s (owner=%s, targets=%s)",
+            "Enabling registry-managed patch %s (owner=%s, target=%s)",
             descriptor.key,
             descriptor.owner_module,
-            ", ".join(descriptor.targets),
+            descriptor.target,
         )
-        descriptor.apply()
+        _apply_target_patch(descriptor)
         if descriptor.verify is not None:
             descriptor.verify()
+        else:
+            _verify_target_patch(descriptor)
         _applied_patch_keys.add(descriptor.key)
 
 
@@ -183,9 +253,6 @@ def import_legacy_patch_modules() -> None:
     _legacy_patch_modules_loaded = True
 
 
-_validate_registry_layout()
-
-
 __all__ = (
     "PatchDescriptor",
     "apply_patch_descriptors",
@@ -195,4 +262,5 @@ __all__ = (
     "get_registered_patch_descriptors",
     "import_legacy_patch_modules",
     "register_general_extensions",
+    "register_patch",
 )

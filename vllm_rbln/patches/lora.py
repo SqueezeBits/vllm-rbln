@@ -1,24 +1,37 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import torch.nn.functional as F
 from vllm.lora.layers import VocabParallelEmbeddingWithLoRA
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
+from vllm_rbln.patches.patch_registry import register_patch
 
+# NOTE(RBLN): This patch originated from
+# https://github.com/RBLN-SW/vllm-rbln/pull/169 while adding initial LoRA
+# support to the RBLN vLLM-model path.
+
+
+@register_patch(
+    target="vllm.lora.layers.base_linear.BaseLinearLayerWithLoRA.apply",
+    reason=(
+        "Adapt LoRA linear composition to the RBLN vLLM-model execution path, "
+        "where the effective input/output tensor shapes differ from the "
+        "upstream vLLM path."
+    ),
+)
 def base_linear_patched_apply(
     self: BaseLinearLayerWithLoRA, x: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -39,10 +52,18 @@ def base_linear_patched_apply(
     return lora_output.view(output_org_shape)
 
 
+@register_patch(
+    target="vllm.lora.layers.VocabParallelEmbeddingWithLoRA.forward",
+    reason=(
+        "Adapt LoRA embedding composition to the RBLN vLLM-model execution "
+        "path, where prefill/decode tensor shapes and Punica metadata layout "
+        "differ from the upstream vLLM path."
+    ),
+)
 def vocab_parallel_embedding_patched_forward(
     self: VocabParallelEmbeddingWithLoRA, x: torch.Tensor
 ) -> torch.Tensor:
-    # NOTE: It assumes that the batch size of prefill phase is always 1.
+    # RBLN(NOTE): It assumes that the batch size of prefill phase is always 1.
     is_prefill = x.shape[0] == 1
     added_tokens_mask = torch.where(x > self.base_layer.org_vocab_size - 1, 1, 0)
     num_tokens = x.size(1) if is_prefill else x.size(0)
@@ -70,7 +91,3 @@ def vocab_parallel_embedding_patched_forward(
     )
 
     return lora_output.view_as(full_output_org)
-
-
-BaseLinearLayerWithLoRA.apply = base_linear_patched_apply
-VocabParallelEmbeddingWithLoRA.forward = vocab_parallel_embedding_patched_forward

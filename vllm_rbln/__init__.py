@@ -46,6 +46,7 @@ def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
+        import vllm_rbln.patches  # noqa: F401
         from vllm_rbln.patches.patch_registry import (
             apply_registered_patches,
             import_legacy_patch_modules,

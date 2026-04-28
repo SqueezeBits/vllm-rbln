@@ -24,15 +24,15 @@ def reset_patch_registry_state(monkeypatch):
     monkeypatch.setattr(patch_registry, "_legacy_patch_modules_loaded", False)
 
 
-def _build_descriptor(*, key: str, owner_module: str):
+def _build_descriptor(*, key: str, owner_module: str, target: str | None = None):
     from vllm_rbln.patches.patch_registry import PatchDescriptor
 
     return PatchDescriptor(
         key=key,
         owner_module=owner_module,
-        targets=("vllm.fake.symbol",),
+        target=target or "vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        replacement=object(),
         reason="test descriptor",
-        apply=lambda: None,
     )
 
 
@@ -52,7 +52,8 @@ def test_patch_registry_splits_general_extensions_from_legacy_patches():
     assert general_extensions.isdisjoint(legacy_patches)
 
 
-def test_apply_patch_descriptors_is_idempotent():
+def test_apply_patch_descriptors_is_idempotent(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
     from vllm_rbln.patches.patch_registry import (
         PatchDescriptor,
         apply_patch_descriptors,
@@ -63,9 +64,20 @@ def test_apply_patch_descriptors_is_idempotent():
     descriptor = PatchDescriptor(
         key="test.patch_registry.idempotent",
         owner_module="tests.patch_registry",
-        targets=("vllm.fake.symbol",),
+        target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        replacement=object(),
         reason="test descriptor",
-        apply=lambda: applied.append("called"),
+    )
+
+    monkeypatch.setattr(
+        patch_registry,
+        "_apply_target_patch",
+        lambda _: applied.append("called"),
+    )
+    monkeypatch.setattr(
+        patch_registry,
+        "_verify_target_patch",
+        lambda _: None,
     )
 
     apply_patch_descriptors((descriptor,))
@@ -94,6 +106,7 @@ def test_apply_patch_descriptors_is_idempotent():
                 _build_descriptor(
                     key="duplicate.key",
                     owner_module="owner.module.two",
+                    target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT_TWO",
                 ),
             ),
             "duplicate patch descriptor key: duplicate.key",
@@ -104,14 +117,14 @@ def test_apply_patch_descriptors_is_idempotent():
             (
                 _build_descriptor(
                     key="patch.key.one",
-                    owner_module="owner.module",
+                    owner_module="owner.module.one",
                 ),
                 _build_descriptor(
                     key="patch.key.two",
-                    owner_module="owner.module",
+                    owner_module="owner.module.two",
                 ),
             ),
-            "duplicate patch descriptor owner module: owner.module",
+            "duplicate patch descriptor target: vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",  # noqa: E501
         ),
         (
             ("owner.module",),
@@ -150,7 +163,9 @@ def test_validate_registry_layout_rejects_invalid_configs(
         patch_registry, "_GENERAL_EXTENSION_MODULES", general_extensions
     )
     monkeypatch.setattr(patch_registry, "_LEGACY_PATCH_MODULES", legacy_patches)
-    monkeypatch.setattr(patch_registry, "_REGISTERED_PATCH_DESCRIPTORS", descriptors)
+    monkeypatch.setattr(
+        patch_registry, "_REGISTERED_PATCH_DESCRIPTORS", list(descriptors)
+    )
 
     with pytest.raises(ValueError, match=message):
         patch_registry._validate_registry_layout()
@@ -163,22 +178,63 @@ def test_apply_patch_descriptors_runs_verify_once(monkeypatch):
         apply_patch_descriptors,
     )
 
-    monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
-
     events: list[str] = []
     descriptor = PatchDescriptor(
         key="test.patch_registry.verify",
         owner_module="tests.patch_registry.verify",
-        targets=("vllm.fake.symbol",),
+        target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        replacement=object(),
         reason="test descriptor",
-        apply=lambda: events.append("apply"),
         verify=lambda: events.append("verify"),
+    )
+
+    monkeypatch.setattr(
+        patch_registry,
+        "_apply_target_patch",
+        lambda _: events.append("apply"),
     )
 
     apply_patch_descriptors((descriptor,))
     apply_patch_descriptors((descriptor,))
 
     assert events == ["apply", "verify"]
+
+
+def test_apply_patch_descriptors_skips_when_condition_is_false(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
+    from vllm_rbln.patches.patch_registry import (
+        PatchDescriptor,
+        apply_patch_descriptors,
+    )
+
+    events: list[str] = []
+    debug_calls: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        patch_registry.logger,
+        "debug",
+        lambda message, *args: debug_calls.append((message, args)),
+    )
+
+    descriptor = PatchDescriptor(
+        key="test.patch_registry.condition",
+        owner_module="tests.patch_registry.condition",
+        target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        replacement=object(),
+        reason="test descriptor",
+        condition=lambda: False,
+        verify=lambda: events.append("verify"),
+    )
+
+    monkeypatch.setattr(
+        patch_registry,
+        "_apply_target_patch",
+        lambda _: events.append("apply"),
+    )
+
+    apply_patch_descriptors((descriptor,))
+
+    assert events == []
+    assert debug_calls == []
 
 
 def test_register_general_extensions_imports_only_once(monkeypatch):
@@ -226,32 +282,31 @@ def test_apply_patch_descriptors_logs_when_patch_is_enabled(monkeypatch):
         apply_patch_descriptors,
     )
 
-    monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
-
     debug_calls: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
         patch_registry.logger,
         "debug",
         lambda message, *args: debug_calls.append((message, args)),
     )
+    monkeypatch.setattr(patch_registry, "_verify_target_patch", lambda _: None)
 
     descriptor = PatchDescriptor(
         key="test.patch_registry.logging",
         owner_module="tests.patch_registry.logging",
-        targets=("vllm.fake.symbol",),
+        target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        replacement=object(),
         reason="test descriptor",
-        apply=lambda: None,
     )
 
     apply_patch_descriptors((descriptor,))
 
     assert debug_calls == [
         (
-            "Enabling registry-managed patch %s (owner=%s, targets=%s)",
+            "Enabling registry-managed patch %s (owner=%s, target=%s)",
             (
                 "test.patch_registry.logging",
                 "tests.patch_registry.logging",
-                "vllm.fake.symbol",
+                "vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
             ),
         )
     ]
