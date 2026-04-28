@@ -30,6 +30,7 @@ from . import (
     lora,  # noqa: F401
     models_deepseek_v2,  # noqa: F401
     models_gpt_oss,  # noqa: F401
+    models_minimax_m2,  # noqa: F401
     models_qwen2,  # noqa: F401
     models_qwen2_moe,  # noqa: F401
     models_qwen3,  # noqa: F401
