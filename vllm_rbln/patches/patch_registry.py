@@ -94,7 +94,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.forward_context",
     "vllm_rbln.model_executor.layers.fused_moe.layer",
     "vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe",
-    "vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision",
     "vllm_rbln.model_executor.layers.quantization.mxfp4",
     "vllm_rbln.model_executor.layers.quantization.fp8",
 )
