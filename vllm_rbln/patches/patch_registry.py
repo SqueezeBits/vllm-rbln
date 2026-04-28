@@ -98,7 +98,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.model_executor.layers.quantization.mxfp4",
     "vllm_rbln.model_executor.layers.quantization.fp8",
     "vllm_rbln.model_executor.model_loader.weight_loader",
-    "vllm_rbln.models.gpt_oss",
     "vllm_rbln.models.minimax_m2",
 )
 
