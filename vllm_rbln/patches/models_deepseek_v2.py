@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,40 +14,75 @@
 
 import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
+from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV2Attention,
+    DeepseekV2MoE,
+)
+
+from vllm_rbln.patches.patch_registry import register_patch
+
+# NOTE(RBLN): This patch originated from
+# https://github.com/RBLN-SW/vllm-rbln/commit/d6c5ec8960a6108e94698b71191e12e887c09184
+# and was later adjusted in
+# https://github.com/RBLN-SW/vllm-rbln/pull/81 and
+# https://github.com/RBLN-SW/vllm-rbln/pull/367.
 
 
-def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2MoE.forward",
+    reason=(
+        "The RBLN path needs DeepseekV2 MoE blocks to route experts through "
+        "the patched router-callback path while preserving the model-specific "
+        "shared-expert and FP16 scaling behavior, because the upstream "
+        "forward path precomputes router_logits and follows sequence-parallel "
+        "and TP reduction rules that do not match the RBLN fused-MoE "
+        "execution contract."
+    ),
+)
+def rbln_deepseek_v2_moe_forward(
+    self: DeepseekV2MoE,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    shared_output = None
     if self.n_shared_experts is not None:
         shared_output = self.shared_experts(hidden_states)
     if hidden_states.dtype != torch.float16:
         final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router=lambda x: self.gate(x)[0])
+            self.experts(
+                hidden_states=hidden_states,
+                router=lambda x: self.gate(x)[0],
+            )
             * self.routed_scaling_factor
         )
     else:
-        # Fix FP16 overflow
-        # See DeepseekV2DecoderLayer for more details.
+        # Fix FP16 overflow. See DeepseekV2DecoderLayer for more details.
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
+            hidden_states=hidden_states,
+            router=lambda x: self.gate(x)[0],
         )
     if shared_output is not None:
         if hidden_states.dtype != torch.float16:
             final_hidden_states = final_hidden_states + shared_output
         else:
-            # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
             final_hidden_states = final_hidden_states + shared_output * (
                 1.0 / self.routed_scaling_factor
             )
     if self.tp_size > 1:
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
     return final_hidden_states
 
 
-def __deepseek_v2_attention_forward(
-    self,
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2Attention.forward",
+    reason=(
+        "The RBLN path needs a dedicated DeepseekV2 MLA attention path that "
+        "reassembles q/k/v tensors around the patched rotary outputs and "
+        "head-dimension alignment, because the upstream forward path does "
+        "not preserve the tensor shapes expected by RBLN execution."
+    ),
+)
+def rbln_deepseek_v2_attention_forward(
+    self: DeepseekV2Attention,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
@@ -77,7 +112,6 @@ def __deepseek_v2_attention_forward(
 
     q = torch.cat([q_nope, q_pe], dim=-1)
     k = torch.cat([k_nope, k_pe.repeat(1, self.num_local_heads, 1)], dim=-1)
-    # padding value to qk_head_dim for alignment
     if self.qk_head_dim != self.v_head_dim:
         v = torch.nn.functional.pad(
             v, [0, self.qk_head_dim - self.v_head_dim], value=0
@@ -93,8 +127,3 @@ def __deepseek_v2_attention_forward(
 
     output, _ = self.o_proj(attn_output)
     return output
-
-
-# reference is from DeepseekV2MoE.forward
-DeepseekV2MoE.forward = __deepseek_v2_moe_forward_rsd
-DeepseekV2Attention.forward = __deepseek_v2_attention_forward
