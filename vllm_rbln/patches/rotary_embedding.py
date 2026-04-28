@@ -12,15 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 
-rope_original__init__ = RotaryEmbedding.__init__
+from vllm_rbln.patches.patch_registry import register_patch
+
+# NOTE(RBLN): This patch is related to
+# https://github.com/RBLN-SW/vllm-rbln/pull/83, which introduced RoPE changes
+# to improve compatibility with RBLN execution.
+
+rope_original_init = RotaryEmbedding.__init__
 
 
-def rope__custom_init__(
+@register_patch(
+    target="vllm.model_executor.layers.rotary_embedding.base.RotaryEmbedding.__init__",
+    reason=(
+        "The RBLN path needs rotate-half style RoPE caches because that "
+        "cache layout is more compatible with RBLN execution than the "
+        "upstream layout."
+    ),
+)
+def rotary_embedding_init(
     self: RotaryEmbedding,
     head_size: int,
     rotary_dim: int,
@@ -29,7 +42,7 @@ def rope__custom_init__(
     is_neox_style: bool,
     dtype: torch.dtype,
 ):
-    rope_original__init__(
+    rope_original_init(
         self,
         head_size,
         rotary_dim,
@@ -51,6 +64,14 @@ def rope__custom_init__(
     self.register_buffer("sin_cache", sin, persistent=False)
 
 
+@register_patch(
+    target="vllm.model_executor.layers.rotary_embedding.base.RotaryEmbedding.forward_oot",
+    reason=(
+        "The RBLN path needs a dedicated RoPE execution path that consumes "
+        "the rotate-half cache layout prepared at initialization and "
+        "applies rotary embeddings with RBLN-friendly tensor layouts."
+    ),
+)
 def rope_forward_oot(
     self: RotaryEmbedding,
     positions: torch.Tensor,
@@ -114,7 +135,3 @@ def rope_forward_oot(
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
 
     return query, key
-
-
-RotaryEmbedding.__init__ = rope__custom_init__
-RotaryEmbedding.forward_oot = rope_forward_oot
