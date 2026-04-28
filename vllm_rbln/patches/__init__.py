@@ -24,7 +24,10 @@ from vllm_rbln.patches.patch_registry import (
     register_patch,
 )
 
-from . import lora  # noqa: F401
+from . import (
+    logits_processor,  # noqa: F401
+    lora,  # noqa: F401
+)
 
 __all__ = (
     "PatchDescriptor",
