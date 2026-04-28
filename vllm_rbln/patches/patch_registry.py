@@ -93,7 +93,6 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
 # on the legacy path until each cluster is migrated to explicit descriptors.
 _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.model_executor.layers.attention.attention",
-    "vllm_rbln.forward_context",
     "vllm_rbln.model_executor.layers.fused_moe.layer",
     "vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe",
 )

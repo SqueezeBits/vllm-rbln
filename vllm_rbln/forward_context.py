@@ -215,6 +215,3 @@ def _set_forward_context(
                         ),
                         forward_stats,
                     )
-
-
-vfc.set_forward_context = _set_forward_context
