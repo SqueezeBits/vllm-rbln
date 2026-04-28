@@ -26,6 +26,7 @@ from vllm_rbln.patches.patch_registry import (
 
 from . import (
     deepseek_scaling_rope,  # noqa: F401
+    fp8,  # noqa: F401
     linear_kernel_chooser,  # noqa: F401
     load_weights,  # noqa: F401
     logits_processor,  # noqa: F401
