@@ -22,18 +22,19 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models import (
-    deepseek_v2,
-    llama,
-    llama4,
-    minimax_m2,
-    qwen2,
-    qwen2_moe,
-    qwen3_moe,
-)
+from vllm.model_executor.models import deepseek_v2, minimax_m2
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 
+from vllm_rbln.patches.patch_registry import register_patch
+
 logger = init_logger(__name__)
+
+# NOTE(RBLN): This patch file originated from
+# https://github.com/RBLN-SW/vllm-rbln/commit/d6c5ec8960a6108e94698b71191e12e887c09184
+# and was later expanded in
+# https://github.com/RBLN-SW/vllm-rbln/pull/81,
+# https://github.com/RBLN-SW/vllm-rbln/pull/435, and
+# https://github.com/RBLN-SW/vllm-rbln/pull/511.
 
 # Following isort, docstring requires a dummy line
 """
@@ -45,6 +46,14 @@ Therefore, do not implement any logic here.
 """
 
 
+@register_patch(
+    target="vllm.model_executor.models.llama.LlamaModel.load_weights",
+    reason=(
+        "The RBLN path needs Llama weight loading to honor num_hidden_layers "
+        "overrides while preserving the model-specific stacked-projection "
+        "and kv-scale loading rules."
+    ),
+)
 def load_llama_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -119,6 +128,14 @@ def load_llama_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.qwen2.Qwen2Model.load_weights",
+    reason=(
+        "The RBLN path needs Qwen2 weight loading to honor num_hidden_layers "
+        "overrides while preserving the model-specific stacked-projection "
+        "and kv-scale loading rules."
+    ),
+)
 def load_qwen2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -185,6 +202,14 @@ def load_qwen2_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.qwen3_moe.Qwen3MoeModel.load_weights",
+    reason=(
+        "The RBLN path needs Qwen3MoE weight loading to honor "
+        "num_hidden_layers overrides while preserving the model-specific "
+        "stacked-projection, expert-weight, and kv-scale loading rules."
+    ),
+)
 def load_qwen3moe_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
@@ -337,6 +362,15 @@ def load_qwen3moe_weights(
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.qwen2_moe.Qwen2MoeModel.load_weights",
+    reason=(
+        "The RBLN path needs Qwen2MoE weight loading to honor "
+        "num_hidden_layers overrides while preserving the model-specific "
+        "stacked-projection, expert-weight, GGUF remapping, and kv-scale "
+        "loading rules."
+    ),
+)
 def load_qwen2moe_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
@@ -447,6 +481,15 @@ def load_qwen2moe_weights(
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2ForCausalLM.load_weights",
+    reason=(
+        "The RBLN path needs DeepseekV2 weight loading to honor "
+        "num_hidden_layers overrides while skipping spec-decode layers and "
+        "preserving the model-specific expert-weight and kv-scale loading "
+        "rules."
+    ),
+)
 def load_deepseek_v2_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
@@ -544,6 +587,14 @@ def load_deepseek_v2_weights(
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.llama4.Llama4Model.load_weights",
+    reason=(
+        "The RBLN path needs Llama4 weight loading to honor num_hidden_layers "
+        "overrides while preserving the model-specific fused-expert and "
+        "kv-scale loading rules."
+    ),
+)
 def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -625,6 +676,15 @@ def load_llama4_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> se
     return loaded_params
 
 
+@register_patch(
+    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.load_weights",
+    reason=(
+        "The RBLN path needs MiniMaxM2 weight loading to honor "
+        "num_hidden_layers overrides while skipping spec-decode layers and "
+        "preserving the model-specific expert-weight and kv-scale loading "
+        "rules."
+    ),
+)
 def load_minimax_m2_weights(
     self, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> set[str]:
@@ -717,13 +777,3 @@ def load_minimax_m2_weights(
                 weight_loader(param, loaded_weight)
         loaded_params.add(name)
     return loaded_params
-
-
-llama.LlamaModel.load_weights = load_llama_weights
-llama4.Llama4Model.load_weights = load_llama4_weights
-
-qwen2.Qwen2Model.load_weights = load_qwen2_weights
-qwen2_moe.Qwen2MoeModel.load_weights = load_qwen2moe_weights
-qwen3_moe.Qwen3MoeModel.load_weights = load_qwen3moe_weights
-deepseek_v2.DeepseekV2ForCausalLM.load_weights = load_deepseek_v2_weights
-minimax_m2.MiniMaxM2Model.load_weights = load_minimax_m2_weights

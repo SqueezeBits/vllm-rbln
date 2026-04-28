@@ -97,7 +97,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision",
     "vllm_rbln.model_executor.layers.quantization.mxfp4",
     "vllm_rbln.model_executor.layers.quantization.fp8",
-    "vllm_rbln.model_executor.model_loader.weight_loader",
 )
 
 _applied_patch_keys: set[str] = set()
