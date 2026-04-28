@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,9 +19,24 @@ from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, logger
 
+from vllm_rbln.patches.patch_registry import register_patch
 
-def __auto_weights_loader__load_module(
-    self,
+# NOTE(RBLN): This patch originated from
+# https://github.com/RBLN-SW/vllm-rbln/pull/81 while enabling TP logits/model
+# loading paths for the RBLN vLLM-model path.
+
+
+@register_patch(
+    target="vllm.model_executor.models.utils.AutoWeightsLoader._load_module",
+    reason=(
+        "The RBLN path needs tied embed_tokens weights to be replayed through "
+        "the LM-head loading path when tensor parallelism is enabled, "
+        "because token embeddings stay replicated while ParallelLMHead "
+        "remains tensor-parallel sharded."
+    ),
+)
+def auto_weights_loader_load_module(
+    self: AutoWeightsLoader,
     base_prefix: str,
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -52,17 +67,17 @@ def __auto_weights_loader__load_module(
     # that aren't registered as params, e.g., batchnorm statistics.
     self._add_loadable_non_param_tensors(module, child_params)
 
-    EMBED_TOKENS = "embed_tokens"
-    LM_HEAD = "lm_head"
-    tie_word_embeddings = any(p.startswith(LM_HEAD) for p in self.skip_prefixes)
+    embed_tokens_name = "embed_tokens"
+    lm_head_name = "lm_head"
+    tie_word_embeddings = any(p.startswith(lm_head_name) for p in self.skip_prefixes)
     tp_enabled = get_tensor_model_parallel_world_size() > 1
 
     embed_tokens: list[tuple[str, torch.Tensor]] = []
 
-    def gen_weights(cur_weights):
+    def gen_weights(cur_weights: Iterable[tuple[str, torch.Tensor]]):
         for name, weight in cur_weights:
-            if name.startswith(EMBED_TOKENS):
-                new_name = name.replace(EMBED_TOKENS, LM_HEAD)
+            if name.startswith(embed_tokens_name):
+                new_name = name.replace(embed_tokens_name, lm_head_name)
                 embed_tokens.append((new_name, weight))
             yield (name, weight)
 
@@ -110,20 +125,20 @@ def __auto_weights_loader__load_module(
             )
             raise ValueError(msg)
 
-    assert len(embed_tokens) < 2
-    if len(embed_tokens) != 0:
+    if embed_tokens:
         org_skip_prefixes = self.skip_prefixes
-        self.skip_prefixes = [p for p in org_skip_prefixes if not p.startswith(LM_HEAD)]
+        self.skip_prefixes = [
+            p for p in org_skip_prefixes if not p.startswith(lm_head_name)
+        ]
 
         for child_prefix, child_weights in self._groupby_prefix(embed_tokens):
-            assert child_prefix == LM_HEAD
+            assert child_prefix == lm_head_name
             prefix = self._get_qualname(base_prefix, child_prefix)
             if child_prefix in child_modules:
                 yield from self._load_module(
-                    prefix, child_modules[child_prefix], child_weights
+                    prefix,
+                    child_modules[child_prefix],
+                    child_weights,
                 )
 
         self.skip_prefixes = org_skip_prefixes
-
-
-AutoWeightsLoader._load_module = __auto_weights_loader__load_module

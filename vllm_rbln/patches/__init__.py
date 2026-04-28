@@ -28,6 +28,7 @@ from . import (
     deepseek_scaling_rope,  # noqa: F401
     logits_processor,  # noqa: F401
     lora,  # noqa: F401
+    models_utils,  # noqa: F401
     rotary_embedding,  # noqa: F401
     vocab_parallel_embedding,  # noqa: F401
 )

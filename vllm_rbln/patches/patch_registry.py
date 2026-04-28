@@ -105,7 +105,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.models.qwen3",
     "vllm_rbln.models.qwen3_moe",
     "vllm_rbln.models.minimax_m2",
-    "vllm_rbln.models.utils",
 )
 
 _applied_patch_keys: set[str] = set()
