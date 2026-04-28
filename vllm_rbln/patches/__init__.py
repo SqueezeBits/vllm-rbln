@@ -25,6 +25,7 @@ from vllm_rbln.patches.patch_registry import (
 )
 
 from . import (
+    attention,  # noqa: F401
     deepseek_scaling_rope,  # noqa: F401
     forward_context,  # noqa: F401
     fp8,  # noqa: F401

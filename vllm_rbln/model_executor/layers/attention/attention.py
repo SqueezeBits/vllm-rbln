@@ -13,15 +13,11 @@
 # limitations under the License.
 
 import torch
-import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
-)
-from vllm.model_executor.layers.attention.kv_transfer_utils import (
-    maybe_transfer_kv_layer,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
@@ -34,7 +30,6 @@ from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 # Snapshots of upstream implementations (used by RBLN overrides)
 # ---------------------------------------------------------------------------
 _upstream_init = Attention.__init__
-_upstream_get_kv_cache_spec = Attention.get_kv_cache_spec
 
 
 def _rbln_attention_init(self, *args, **kwargs) -> None:
@@ -149,12 +144,3 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             head_size_v=self.head_size_v,
             dtype=self.kv_cache_torch_dtype,
         )
-
-
-vllm_attn.unified_attention = maybe_transfer_kv_layer(_rbln_unified_attention)
-vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
-    _rbln_unified_attention_with_output
-)
-
-Attention.__init__ = _rbln_attention_init
-Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec

@@ -48,7 +48,8 @@ def test_patch_registry_splits_general_extensions_from_legacy_patches():
     assert "vllm_rbln.distributed.kv_transfer.kv_connector.factory" in (
         general_extensions
     )
-    assert "vllm_rbln.model_executor.layers.attention.attention" in legacy_patches
+    assert "vllm_rbln.model_executor.layers.attention.attention" not in legacy_patches
+    assert "vllm_rbln.model_executor.layers.fused_moe.layer" in legacy_patches
     assert general_extensions.isdisjoint(legacy_patches)
 
 
