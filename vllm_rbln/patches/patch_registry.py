@@ -84,6 +84,7 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
     "vllm_rbln.triton_kernels.flash_attention",
     "vllm_rbln.triton_kernels.flash_causal_attention",
     "vllm_rbln.triton_kernels.sliding_window_attention",
+    "vllm_rbln.model_executor.layers.quantization.mxfp4",
 )
 
 
@@ -94,7 +95,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.forward_context",
     "vllm_rbln.model_executor.layers.fused_moe.layer",
     "vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe",
-    "vllm_rbln.model_executor.layers.quantization.mxfp4",
     "vllm_rbln.model_executor.layers.quantization.fp8",
 )
 
