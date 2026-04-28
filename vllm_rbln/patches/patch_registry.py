@@ -100,7 +100,6 @@ _LEGACY_PATCH_MODULES: tuple[str, ...] = (
     "vllm_rbln.model_executor.model_loader.weight_loader",
     "vllm_rbln.models.deepseek_v2",
     "vllm_rbln.models.gpt_oss",
-    "vllm_rbln.models.qwen2",
     "vllm_rbln.models.qwen2_moe",
     "vllm_rbln.models.qwen3",
     "vllm_rbln.models.qwen3_moe",
