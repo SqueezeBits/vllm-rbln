@@ -50,7 +50,7 @@ _UPSTREAM_FUSED_MOE_INIT = FusedMoE.__init__
         "RBLN stores expert_map as a Python constant for custom MoE kernels "
         "while preserving upstream FusedMoE initialization."
     ),
-    order_hint=-10,
+    priority=49,
 )
 def rbln_fused_moe_init(self: FusedMoE, *args, **kwargs) -> None:
     _UPSTREAM_FUSED_MOE_INIT(self, *args, **kwargs)
@@ -230,7 +230,7 @@ def _select_unquantized_apply() -> Callable[
         "RBLN needs FusedMoE.forward_oot to use RBLN MoE quant methods and "
         "RBLN data-parallel multicast/reduction behavior."
     ),
-    order_hint=-10,
+    priority=49,
 )
 def rbln_fused_moe_forward_oot(
     self: FusedMoE,
@@ -284,7 +284,7 @@ def rbln_fused_moe_forward_oot(
         "RBLN needs FusedMoE naive_multicast to pad each DP input to the "
         "compiled max token bucket and gather all DP ranks."
     ),
-    order_hint=-10,
+    priority=49,
 )
 def rbln_fused_moe_naive_multicast(self: FusedMoE, x: torch.Tensor) -> torch.Tensor:
     x = x.reshape(1, -1, x.size(-1))
@@ -320,5 +320,5 @@ register_patch(
         "RBLN routes unquantized MoE through the selected RBLN implementation "
         "based on VLLM_RBLN_MOE_USE_OPT_KERNEL and VLLM_RBLN_MOE_CUSTOM_KERNEL."
     ),
-    order_hint=-10,
+    priority=49,
 )(rbln_unquantized_apply)

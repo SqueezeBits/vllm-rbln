@@ -21,6 +21,10 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+MIN_PATCH_PRIORITY = 0
+MAX_PATCH_PRIORITY = 100
+DEFAULT_PATCH_PRIORITY = 50
+
 
 @dataclass(frozen=True)
 class PatchDescriptor:
@@ -31,7 +35,7 @@ class PatchDescriptor:
     reason: str
     condition: Callable[[], bool] | None = None
     verify: Callable[[], None] | None = None
-    order_hint: int = 0
+    priority: int = DEFAULT_PATCH_PRIORITY
 
 
 _REGISTERED_PATCH_DESCRIPTORS: list[PatchDescriptor] = []
@@ -44,8 +48,30 @@ def register_patch(
     key: str | None = None,
     condition: Callable[[], bool] | None = None,
     verify: Callable[[], None] | None = None,
-    order_hint: int = 0,
+    priority: int = DEFAULT_PATCH_PRIORITY,
 ) -> Callable[[Any], Any]:
+    """Register a replacement object as an RBLN patch descriptor.
+
+    Args:
+        target: Fully qualified upstream symbol path to replace.
+        reason: Human-readable explanation for why the patch is required.
+        key: Optional stable descriptor key. If omitted, the replacement's
+            module and qualified name are used.
+        condition: Optional predicate evaluated at apply time. The patch is
+            skipped when the predicate returns ``False``.
+        verify: Optional callback that validates the patch after assignment.
+            When omitted, the registry verifies that the target is identical to
+            the replacement object.
+        priority: Patch application priority in the inclusive range
+            `[MIN_PATCH_PRIORITY, MAX_PATCH_PRIORITY]`. Lower values are
+            applied earlier. Descriptors with the same priority are ordered by
+            key. Defaults to `DEFAULT_PATCH_PRIORITY`.
+
+    Returns:
+        A decorator that registers the replacement object and returns it
+        unchanged.
+    """
+
     def _decorator(replacement: Any) -> Any:
         replacement_name = getattr(
             replacement,
@@ -66,7 +92,7 @@ def register_patch(
                 reason=reason,
                 condition=condition,
                 verify=verify,
-                order_hint=order_hint,
+                priority=priority,
             )
         )
         return replacement
@@ -103,7 +129,7 @@ def _import_modules(module_names: Iterable[str], *, kind: str) -> None:
 def _sort_patch_descriptors(
     descriptors: Sequence[PatchDescriptor],
 ) -> tuple[PatchDescriptor, ...]:
-    return tuple(sorted(descriptors, key=lambda d: (d.order_hint, d.key)))
+    return tuple(sorted(descriptors, key=lambda d: (d.priority, d.key)))
 
 
 def _resolve_patch_target_owner(target: str) -> tuple[object, str]:
@@ -142,6 +168,14 @@ def _validate_registry_layout() -> None:
     descriptor_keys: set[str] = set()
     descriptor_targets: set[str] = set()
     for descriptor in _REGISTERED_PATCH_DESCRIPTORS:
+        if not MIN_PATCH_PRIORITY <= descriptor.priority <= MAX_PATCH_PRIORITY:
+            msg = (
+                "patch descriptor priority must be between "
+                f"{MIN_PATCH_PRIORITY} and {MAX_PATCH_PRIORITY}: "
+                f"{descriptor.key}={descriptor.priority}"
+            )
+            raise ValueError(msg)
+
         if descriptor.key in descriptor_keys:
             msg = f"duplicate patch descriptor key: {descriptor.key}"
             raise ValueError(msg)

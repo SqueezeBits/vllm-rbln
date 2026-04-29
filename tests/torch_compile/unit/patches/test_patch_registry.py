@@ -23,7 +23,13 @@ def reset_patch_registry_state(monkeypatch):
     monkeypatch.setattr(patch_registry, "_general_extensions_loaded", False)
 
 
-def _build_descriptor(*, key: str, owner_module: str, target: str | None = None):
+def _build_descriptor(
+    *,
+    key: str,
+    owner_module: str,
+    target: str | None = None,
+    priority: int = 50,
+):
     from vllm_rbln.patches.patch_registry import PatchDescriptor
 
     return PatchDescriptor(
@@ -32,6 +38,7 @@ def _build_descriptor(*, key: str, owner_module: str, target: str | None = None)
         target=target or "vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
         replacement=object(),
         reason="test descriptor",
+        priority=priority,
     )
 
 
@@ -84,6 +91,22 @@ def test_apply_patch_descriptors_is_idempotent(monkeypatch):
     assert applied == ["called"]
 
 
+def test_patch_descriptors_sort_by_priority_then_key():
+    from vllm_rbln.patches.patch_registry import _sort_patch_descriptors
+
+    descriptors = (
+        _build_descriptor(key="b.default", owner_module="owner.b"),
+        _build_descriptor(key="a.default", owner_module="owner.a"),
+        _build_descriptor(key="z.high", owner_module="owner.z", priority=49),
+    )
+
+    assert [descriptor.key for descriptor in _sort_patch_descriptors(descriptors)] == [
+        "z.high",
+        "a.default",
+        "b.default",
+    ]
+
+
 @pytest.mark.parametrize(
     ("general_extensions", "descriptors", "message"),
     [
@@ -125,6 +148,28 @@ def test_apply_patch_descriptors_is_idempotent(monkeypatch):
                 ),
             ),
             "patch owner module must not be listed as a general extension: owner.module",  # noqa: E501
+        ),
+        (
+            (),
+            (
+                _build_descriptor(
+                    key="priority.low",
+                    owner_module="owner.module",
+                    priority=-1,
+                ),
+            ),
+            "patch descriptor priority must be between 0 and 100: priority.low=-1",
+        ),
+        (
+            (),
+            (
+                _build_descriptor(
+                    key="priority.high",
+                    owner_module="owner.module",
+                    priority=101,
+                ),
+            ),
+            "patch descriptor priority must be between 0 and 100: priority.high=101",
         ),
     ],
 )

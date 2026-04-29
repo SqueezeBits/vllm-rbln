@@ -84,6 +84,16 @@ def test_fused_moe_patch_descriptors_precede_shared_fused_moe_descriptors():
     import_module("vllm_rbln.patches.shared_fused_moe")
 
     descriptors = get_registered_patch_descriptors()
+    fused_descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if descriptor.owner_module == "vllm_rbln.patches.fused_moe"
+    ]
+    shared_descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if descriptor.owner_module == "vllm_rbln.patches.shared_fused_moe"
+    ]
     fused_indices = [
         index
         for index, descriptor in enumerate(descriptors)
@@ -97,6 +107,8 @@ def test_fused_moe_patch_descriptors_precede_shared_fused_moe_descriptors():
 
     assert fused_indices
     assert shared_indices
+    assert {descriptor.priority for descriptor in fused_descriptors} == {49}
+    assert {descriptor.priority for descriptor in shared_descriptors} == {50}
     assert max(fused_indices) < min(shared_indices)
 
 
