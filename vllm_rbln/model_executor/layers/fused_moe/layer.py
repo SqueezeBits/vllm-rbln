@@ -42,6 +42,96 @@ logger = init_logger(__name__)
 
 _UPSTREAM_FUSED_MOE_INIT = FusedMoE.__init__
 
+if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
+
+    @torch.library.custom_op(
+        "rbln_custom_ops::custom_moe_glu",
+        mutates_args=(),
+    )
+    def custom_moe_glu(
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        masked_routing_weight: torch.Tensor,
+        topk: int,
+        post_norm: bool,
+        expert_map: torch.Tensor | None = None,
+        gate_proj_bias: torch.Tensor | None = None,
+        up_proj_bias: torch.Tensor | None = None,
+        down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = torch.zeros_like(hidden_states)
+        expert_cnt = gate_proj_weight.shape[0]
+        for i in range(expert_cnt):
+            gate = F.linear(hidden_states, gate_proj_weight[i])
+            up = F.linear(hidden_states, up_proj_weight[i])
+            mul = F.silu(gate) * up
+            down = F.linear(mul, down_proj_weight[i])
+            out += down * masked_routing_weight[:, i : i + 1]
+        return out
+
+    @custom_moe_glu.register_fake
+    def custom_moe_glu_fake(
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        masked_routing_weight: torch.Tensor,
+        topk: int,
+        post_norm: bool,
+        expert_map: torch.Tensor | None = None,
+        gate_proj_bias: torch.Tensor | None = None,
+        up_proj_bias: torch.Tensor | None = None,
+        down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.empty_like(hidden_states)
+
+else:
+
+    @torch.library.custom_op(
+        "rbln_custom_ops::custom_moe_glu",
+        mutates_args=(),
+    )
+    def custom_moe_glu(
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        masked_routing_weight: torch.Tensor,
+        expert_select_count: torch.Tensor,
+        gate_proj_bias: torch.Tensor | None = None,
+        up_proj_bias: torch.Tensor | None = None,
+        down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = torch.zeros_like(hidden_states)
+        expert_cnt = gate_proj_weight.shape[0]
+        for i in range(expert_cnt):
+            gate = F.linear(hidden_states, gate_proj_weight[i])
+            up = F.linear(hidden_states, up_proj_weight[i])
+            mul = F.silu(gate) * up
+            down = F.linear(mul, down_proj_weight[i])
+            out += down * masked_routing_weight[:, i : i + 1]
+        return out
+
+    @custom_moe_glu.register_fake
+    def custom_moe_glu_fake(
+        hidden_states: torch.Tensor,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        masked_routing_weight: torch.Tensor,
+        expert_select_count: torch.Tensor,
+        gate_proj_bias: torch.Tensor | None = None,
+        up_proj_bias: torch.Tensor | None = None,
+        down_proj_bias: torch.Tensor | None = None,
+        dp_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.empty_like(hidden_states)
+
 
 def patched_fused_moe_init(self: FusedMoE, *args, **kwargs) -> None:
     _UPSTREAM_FUSED_MOE_INIT(self, *args, **kwargs)

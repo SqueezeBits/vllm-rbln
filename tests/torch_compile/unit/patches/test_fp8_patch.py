@@ -15,6 +15,7 @@
 from importlib import import_module
 
 import pytest
+import torch
 import vllm.model_executor.layers.quantization.fp8 as upstream_fp8
 
 from vllm_rbln.model_executor.layers.quantization.fp8 import (
@@ -24,7 +25,6 @@ from vllm_rbln.model_executor.layers.quantization.fp8 import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_general_extension_modules,
     get_registered_patch_descriptors,
 )
 
@@ -49,12 +49,6 @@ def _get_fp8_descriptors():
     )
 
 
-def test_fp8_custom_op_module_is_registered_as_general_extension():
-    custom_op_module = "vllm_rbln.model_executor.layers.quantization.fp8"
-
-    assert custom_op_module in get_general_extension_modules()
-
-
 def test_fp8_patch_descriptors_are_registry_managed():
     descriptors = _get_fp8_descriptors()
 
@@ -62,6 +56,12 @@ def test_fp8_patch_descriptors_are_registry_managed():
         "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod",
         "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod",
     }
+
+
+def test_fp8_implementation_import_registers_custom_op():
+    _get_fp8_patch_module()
+
+    assert hasattr(torch.ops.rbln_custom_ops, "custom_moe_swiglu_group_dequantize")
 
 
 def test_fp8_patch_descriptors_update_targets(monkeypatch):

@@ -115,9 +115,6 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
     "vllm_rbln.triton_kernels.flash_attention",
     "vllm_rbln.triton_kernels.flash_causal_attention",
     "vllm_rbln.triton_kernels.sliding_window_attention",
-    "vllm_rbln.model_executor.layers.fused_moe.custom_ops",
-    "vllm_rbln.model_executor.layers.quantization.mxfp4",
-    "vllm_rbln.model_executor.layers.quantization.fp8",
 )
 
 

@@ -47,18 +47,21 @@ def _patch_registry_replacement():
 
 
 def test_patch_registry_separates_general_extensions_from_patch_descriptors():
+    import vllm_rbln.patches  # noqa: F401
     from vllm_rbln.patches.patch_registry import (
         get_general_extension_modules,
+        get_registered_patch_descriptors,
     )
 
     general_extensions = set(get_general_extension_modules())
+    descriptor_owner_modules = {
+        descriptor.owner_module for descriptor in get_registered_patch_descriptors()
+    }
 
     assert "vllm_rbln.distributed.kv_transfer.kv_connector.factory" in (
         general_extensions
     )
-    assert "vllm_rbln.model_executor.layers.fused_moe.custom_ops" in (
-        general_extensions
-    )
+    assert general_extensions.isdisjoint(descriptor_owner_modules)
 
 
 def test_apply_patch_descriptors_is_idempotent(monkeypatch):

@@ -15,6 +15,7 @@
 from importlib import import_module
 
 import pytest
+import torch
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     UnquantizedFusedMoEMethod,
@@ -28,7 +29,6 @@ from vllm_rbln.model_executor.layers.fused_moe.layer import (
 )
 from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
-    get_general_extension_modules,
     get_registered_patch_descriptors,
 )
 
@@ -75,15 +75,18 @@ def _get_fused_moe_descriptors():
 def test_fused_moe_patch_descriptors_are_registry_managed():
     descriptors = _get_fused_moe_descriptors()
 
-    assert "vllm_rbln.model_executor.layers.fused_moe.custom_ops" in (
-        get_general_extension_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.fused_moe.layer.FusedMoE.__init__",
         "vllm.model_executor.layers.fused_moe.layer.FusedMoE.forward_oot",
         "vllm.model_executor.layers.fused_moe.layer.FusedMoE.naive_multicast",
         ("vllm.model_executor.layers.fused_moe.layer.UnquantizedFusedMoEMethod.apply"),
     }
+
+
+def test_fused_moe_layer_import_registers_custom_op():
+    _get_fused_moe_patch_module()
+
+    assert hasattr(torch.ops.rbln_custom_ops, "custom_moe_glu")
 
 
 def test_fused_moe_patch_descriptors_precede_shared_fused_moe_descriptors():

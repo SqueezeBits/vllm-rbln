@@ -15,13 +15,13 @@
 from importlib import import_module
 
 import pytest
+import torch
 import vllm.model_executor.layers.quantization.mxfp4 as upstream_mxfp4
 
 from vllm_rbln.model_executor.layers.quantization.mxfp4 import PatchedMxfp4MoEMethod
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_general_extension_modules,
     get_registered_patch_descriptors,
 )
 
@@ -46,18 +46,18 @@ def _get_mxfp4_descriptors():
     )
 
 
-def test_mxfp4_custom_op_module_is_registered_as_general_extension():
-    custom_op_module = "vllm_rbln.model_executor.layers.quantization.mxfp4"
-
-    assert custom_op_module in get_general_extension_modules()
-
-
 def test_mxfp4_patch_descriptor_is_registry_managed():
     descriptors = _get_mxfp4_descriptors()
 
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.quantization.mxfp4.Mxfp4MoEMethod",
     }
+
+
+def test_mxfp4_implementation_import_registers_custom_op():
+    _get_mxfp4_patch_module()
+
+    assert hasattr(torch.ops.rbln_custom_ops, "custom_moe_glu_mxfp4")
 
 
 def test_mxfp4_patch_descriptor_updates_target(monkeypatch):
