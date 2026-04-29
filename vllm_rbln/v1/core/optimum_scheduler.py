@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorMetadata,
+    ECConnectorRole,
+)
+from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
@@ -26,11 +31,13 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.perf import ModelMetrics
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -103,7 +110,11 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
+        self.max_num_scheduled_tokens = (
+            self.scheduler_config.max_num_scheduled_tokens
+            if self.scheduler_config.max_num_scheduled_tokens
+            else self.scheduler_config.max_num_batched_tokens
+        )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -120,6 +131,11 @@ class RBLNOptimumScheduler(Scheduler):
             self.parallel_config.data_parallel_rank,
         )
         self.ec_connector = None
+        if self.vllm_config.ec_transfer_config is not None:
+            self.ec_connector = ECConnectorFactory.create_connector(
+                config=self.vllm_config, role=ECConnectorRole.SCHEDULER
+            )
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -135,6 +151,8 @@ class RBLNOptimumScheduler(Scheduler):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
+        # requests skipped in waiting flow due async deps or constraints.
+        self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -142,6 +160,10 @@ class RBLNOptimumScheduler(Scheduler):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+
+        # Counter for requests waiting for streaming input. Used to calculate
+        # number of unfinished requests
+        self.num_waiting_for_streaming_input: int = 0
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -169,7 +191,9 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size=attn_block_size,
             max_num_seqs=self.max_num_running_reqs,
         )
-
+        self.perf_metrics: ModelMetrics | None = None
+        if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
+            self.perf_metrics = ModelMetrics(vllm_config)
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
@@ -192,6 +216,7 @@ class RBLNOptimumScheduler(Scheduler):
 
         self.use_pp = False
         self.use_v2_model_runner = False
+        self._pause_state: PauseState = PauseState.UNPAUSED
 
     def schedule(self) -> RBLNSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -214,6 +239,11 @@ class RBLNOptimumScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # https://github.com/vllm-project/vllm/pull/34125
+        if self._pause_state == PauseState.PAUSED_ALL:
+            # Do not schedule any requests when paused.
+            token_budget = 0
+
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -244,31 +274,35 @@ class RBLNOptimumScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Use a temporary RequestQueue to collect requests that need to be
-        # skipped and put back at the head of the waiting queue later
-        skipped_waiting_requests = create_request_queue(self.policy)
+        self.kv_cache_manager.new_step_starts()
 
         # First, schedule the WAITING requests.
-        if not preempted_reqs:
-            while self.waiting and token_budget > 0:
+        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            step_skipped_waiting = create_request_queue(self.policy)
+            while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
-
-                request = self.waiting.peek_request()
+                request_queue = self._select_waiting_queue_for_scheduling()
+                assert request_queue is not None
+                request = request_queue.peek_request()
+                request_id = request.request_id
+                # try to promote blocked statuses while traversing skipped queue.
                 # NOTE(eunji): prefill request is allowed only one
                 if req_index > 0:
                     break
 
-                # Skip request if the structured output request is still waiting
-                # for FSM compilation.
-                if request.status == RequestStatus.WAITING_FOR_FSM:
-                    structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
-                        request.status = RequestStatus.WAITING
-                    else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
+                # try to promote blocked statuses while traversing skipped queue.
+                if self._is_blocked_waiting_status(
+                    request.status
+                ) and not self._try_promote_blocked_waiting_request(request):
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        logger.debug(
+                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                            request_id,
+                        )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -281,8 +315,8 @@ class RBLNOptimumScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
                     continue
 
                 assert request.num_computed_tokens == 0
@@ -334,7 +368,7 @@ class RBLNOptimumScheduler(Scheduler):
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
-                request = self.waiting.pop_request()
+                request = request_queue.pop_request()
 
                 req_index += 1
                 self.running.append(request)
@@ -351,8 +385,8 @@ class RBLNOptimumScheduler(Scheduler):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.get_blocks(request.request_id)
+                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
+                    request_id
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
@@ -361,14 +395,21 @@ class RBLNOptimumScheduler(Scheduler):
                 # by prefix caching may cause incorrect computation
                 # of new_blocks during the decode phase.
                 request.num_computed_tokens = 0
-                # NOTE num_cached_tokens is
-                # used for disaggregated prefill,decode.
-                # We don't set it here because it is not used in RBLN.
-                # request.num_cached_tokens = -1
+                # NOTE(fix): num_cached_tokens defaults to -1.
+                # It is used for logging and metrics.
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = request.num_computed_tokens
 
-        # Put back any skipped requests at the head of the waiting queue
-        if skipped_waiting_requests:
-            self.waiting.prepend_requests(skipped_waiting_requests)
+                # EC Connector: track multimodal features that need remote
+                # loading or local encoding for this request.
+                if self.ec_connector is not None and request.has_encoder_inputs:
+                    for i, feature in enumerate(request.mm_features):
+                        if self.ec_connector.has_cache_item(feature.identifier):
+                            self.ec_connector.update_state_after_alloc(request, i)
+
+            # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_waiting:
+                self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
         # Next, schedule the RUNNING requests.
         if req_index == 0:
@@ -417,13 +458,13 @@ class RBLNOptimumScheduler(Scheduler):
                             )
                             self.running.remove(preempted_req)
                             if preempted_req in scheduled_running_reqs:
+                                preempted_req_id = preempted_req.request_id
                                 scheduled_running_reqs.remove(preempted_req)
-                                ###
-                                token_budget += num_scheduled_tokens[
-                                    preempted_req.request_id
-                                ]
-                                req_to_new_blocks.pop(preempted_req.request_id)
-                                num_scheduled_tokens.pop(preempted_req.request_id)
+                                token_budget += num_scheduled_tokens.pop(
+                                    preempted_req_id
+                                )
+                                req_to_new_blocks.pop(preempted_req_id)
+                                scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                                 req_index -= 1
                         else:
                             preempted_req = self.running.pop()
@@ -440,8 +481,9 @@ class RBLNOptimumScheduler(Scheduler):
                     self.update_block_table_dict(request, block_table_dict)
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
-                req_to_new_blocks[request.request_id] = new_blocks
-                num_scheduled_tokens[request.request_id] = num_new_tokens
+                request_id = request.request_id
+                req_to_new_blocks[request_id] = new_blocks
+                num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 req_index += 1
 
@@ -512,11 +554,28 @@ class RBLNOptimumScheduler(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
+            new_block_ids_to_zero=None,  # It is used for Mamba models
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
             cached_length=cached_length,
             dummy_block=dummy_block,
         )
+
+        # Build the connector meta for ECConnector.
+        # Also pre-fetch mm_hashes from the waiting queue so the consumer
+        # can pull encoder caches in the background before they are needed.
+        if self.ec_connector is not None:
+            for request in self.waiting:
+                if request.has_encoder_inputs:
+                    for i, feature in enumerate(request.mm_features):
+                        if self.ec_connector.has_cache_item(feature.identifier):
+                            self.ec_connector.update_state_after_alloc(request, i)
+
+            ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
+                scheduler_output
+            )
+            scheduler_output.ec_connector_metadata = ec_meta
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)
@@ -534,6 +593,9 @@ class RBLNOptimumScheduler(Scheduler):
         request: Request,
         timestamp: float,
     ) -> None:
+        assert request.status == RequestStatus.RUNNING, (
+            "Only running requests can be preempted"
+        )
         preempted_blocks = self.kv_cache_manager.get_block_ids(request.request_id)[0]
         self.kv_cache_manager.free(request, preemption=True)
         if not self.cache_config.enable_prefix_caching:
