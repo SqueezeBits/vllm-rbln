@@ -20,7 +20,6 @@ import vllm.model_executor.kernels.linear as linear
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -48,10 +47,6 @@ def _get_linear_kernel_chooser_descriptors():
 def test_linear_kernel_chooser_patch_descriptor_is_registry_managed():
     descriptors = _get_linear_kernel_chooser_descriptors()
 
-    assert (
-        "vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision"
-        not in get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.kernels.linear.choose_mp_linear_kernel",
     }

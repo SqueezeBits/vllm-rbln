@@ -19,7 +19,6 @@ from vllm_rbln.patches.models_minimax_m2 import rbln_minimax_m2_moe_forward
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -42,7 +41,6 @@ def _get_minimax_m2_descriptors():
 def test_minimax_m2_patch_descriptor_is_registry_managed():
     descriptors = _get_minimax_m2_descriptors()
 
-    assert "vllm_rbln.models.minimax_m2" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.minimax_m2.MiniMaxM2MoE.forward",
     }

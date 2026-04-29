@@ -23,7 +23,6 @@ from vllm_rbln.patches.lora import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -46,7 +45,6 @@ def _get_lora_descriptors():
 def test_lora_patch_descriptors_are_registry_managed():
     descriptors = _get_lora_descriptors()
 
-    assert "vllm_rbln.lora.layer" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.lora.layers.base_linear.BaseLinearLayerWithLoRA.apply",
         "vllm.lora.layers.VocabParallelEmbeddingWithLoRA.forward",

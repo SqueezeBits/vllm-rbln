@@ -19,7 +19,6 @@ from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -69,10 +68,6 @@ def _get_shared_fused_moe_descriptors():
 def test_shared_fused_moe_patch_descriptors_are_registry_managed():
     descriptors = _get_shared_fused_moe_descriptors()
 
-    assert (
-        "vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe"
-        not in get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         (
             "vllm.model_executor.layers.fused_moe.shared_fused_moe."

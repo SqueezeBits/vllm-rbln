@@ -23,7 +23,6 @@ from vllm_rbln.patches.logits_processor import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -46,9 +45,6 @@ def _get_logits_descriptors():
 def test_logits_processor_patch_descriptors_are_registry_managed():
     descriptors = _get_logits_descriptors()
 
-    assert "vllm_rbln.model_executor.layers.logits_processor" not in (
-        get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.logits_processor.LogitsProcessor._get_logits",
         "vllm.model_executor.layers.logits_processor.LogitsProcessor._gather_logits",

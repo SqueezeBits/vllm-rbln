@@ -19,7 +19,6 @@ from vllm_rbln.patches.models_utils import auto_weights_loader_load_module
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -42,7 +41,6 @@ def _get_models_utils_descriptors():
 def test_models_utils_patch_descriptor_is_registry_managed():
     descriptors = _get_models_utils_descriptors()
 
-    assert "vllm_rbln.models.utils" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.utils.AutoWeightsLoader._load_module",
     }

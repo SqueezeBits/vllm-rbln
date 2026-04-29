@@ -22,7 +22,6 @@ from vllm_rbln.patches.models_gpt_oss import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -45,7 +44,6 @@ def _get_gpt_oss_descriptors():
 def test_gpt_oss_patch_descriptors_are_registry_managed():
     descriptors = _get_gpt_oss_descriptors()
 
-    assert "vllm_rbln.models.gpt_oss" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.gpt_oss.GptOssModel._load_weights_mxfp4",
         "vllm.model_executor.models.gpt_oss.MLPBlock.forward",

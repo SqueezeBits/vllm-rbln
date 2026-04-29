@@ -33,7 +33,6 @@ from vllm_rbln.patches.load_weights import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -56,9 +55,6 @@ def _get_load_weights_descriptors():
 def test_load_weights_patch_descriptors_are_registry_managed():
     descriptors = _get_load_weights_descriptors()
 
-    assert "vllm_rbln.model_executor.model_loader.weight_loader" not in (
-        get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.llama.LlamaModel.load_weights",
         "vllm.model_executor.models.llama4.Llama4Model.load_weights",

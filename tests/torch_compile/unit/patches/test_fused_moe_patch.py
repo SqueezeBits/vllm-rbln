@@ -23,7 +23,6 @@ from vllm.model_executor.layers.fused_moe.layer import (
 from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
     get_general_extension_modules,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -70,9 +69,6 @@ def _get_fused_moe_descriptors():
 def test_fused_moe_patch_descriptors_are_registry_managed():
     descriptors = _get_fused_moe_descriptors()
 
-    assert "vllm_rbln.model_executor.layers.fused_moe.layer" not in (
-        get_legacy_patch_modules()
-    )
     assert "vllm_rbln.model_executor.layers.fused_moe.custom_ops" in (
         get_general_extension_modules()
     )

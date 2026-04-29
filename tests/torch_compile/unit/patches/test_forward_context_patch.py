@@ -20,7 +20,6 @@ import vllm.forward_context as upstream_forward_context
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -48,7 +47,6 @@ def _get_forward_context_descriptors():
 def test_forward_context_patch_descriptor_is_registry_managed():
     descriptors = _get_forward_context_descriptors()
 
-    assert "vllm_rbln.forward_context" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.forward_context.set_forward_context",
     }

@@ -22,7 +22,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -50,10 +49,6 @@ def _get_attention_descriptors():
 def test_attention_patch_descriptors_are_registry_managed():
     descriptors = _get_attention_descriptors()
 
-    assert (
-        "vllm_rbln.model_executor.layers.attention.attention"
-        not in get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.attention.attention.unified_attention",
         "vllm.model_executor.layers.attention.attention.unified_attention_with_output",

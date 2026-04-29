@@ -25,7 +25,6 @@ from vllm_rbln.patches.models_deepseek_v2 import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -48,7 +47,6 @@ def _get_deepseek_v2_descriptors():
 def test_deepseek_v2_patch_descriptors_are_registry_managed():
     descriptors = _get_deepseek_v2_descriptors()
 
-    assert "vllm_rbln.models.deepseek_v2" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.deepseek_v2.DeepseekV2MoE.forward",
         "vllm.model_executor.models.deepseek_v2.DeepseekV2Attention.forward",

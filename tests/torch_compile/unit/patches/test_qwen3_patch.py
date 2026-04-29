@@ -19,7 +19,6 @@ from vllm_rbln.patches.models_qwen3 import rbln_qwen3_for_causal_lm_init
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -42,7 +41,6 @@ def _get_qwen3_descriptors():
 def test_qwen3_patch_descriptor_is_registry_managed():
     descriptors = _get_qwen3_descriptors()
 
-    assert "vllm_rbln.models.qwen3" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.qwen3.Qwen3ForCausalLM.__init__",
     }

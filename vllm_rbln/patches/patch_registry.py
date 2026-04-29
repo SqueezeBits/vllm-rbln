@@ -75,8 +75,8 @@ def register_patch(
 
 
 # NOTE: These modules are part of bootstrap/registration, not upstream symbol
-# replacement. They are kept separate from legacy patch modules so migration to
-# registry-managed patches can proceed incrementally without obscuring intent.
+# replacement. Keep them separate from descriptor-based RBLN patches so the
+# patch inventory stays focused on upstream symbol replacement.
 _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
     "vllm_rbln.distributed.kv_transfer.kv_connector.factory",
     "vllm_rbln.triton_kernels.attention",
@@ -90,13 +90,8 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
 )
 
 
-# NOTE: These modules still patch upstream symbols at import time. They remain
-# on the legacy path until each cluster is migrated to explicit descriptors.
-_LEGACY_PATCH_MODULES: tuple[str, ...] = ()
-
 _applied_patch_keys: set[str] = set()
 _general_extensions_loaded = False
-_legacy_patch_modules_loaded = False
 
 
 def _import_modules(module_names: Iterable[str], *, kind: str) -> None:
@@ -143,10 +138,6 @@ def _verify_target_patch(descriptor: PatchDescriptor) -> None:
 
 def _validate_registry_layout() -> None:
     general_extensions = set(_GENERAL_EXTENSION_MODULES)
-    legacy_patches = set(_LEGACY_PATCH_MODULES)
-    if not general_extensions.isdisjoint(legacy_patches):
-        msg = "general extension modules and legacy patch modules must be disjoint"
-        raise ValueError(msg)
 
     descriptor_keys: set[str] = set()
     descriptor_targets: set[str] = set()
@@ -163,25 +154,14 @@ def _validate_registry_layout() -> None:
 
         if descriptor.owner_module in general_extensions:
             msg = (
-                "registry-managed patch owner module must not be listed as a "
+                "patch owner module must not be listed as a "
                 f"general extension: {descriptor.owner_module}"
-            )
-            raise ValueError(msg)
-
-        if descriptor.owner_module in legacy_patches:
-            msg = (
-                "registry-managed patch owner module must not remain in the "
-                f"legacy path: {descriptor.owner_module}"
             )
             raise ValueError(msg)
 
 
 def get_general_extension_modules() -> tuple[str, ...]:
     return _GENERAL_EXTENSION_MODULES
-
-
-def get_legacy_patch_modules() -> tuple[str, ...]:
-    return _LEGACY_PATCH_MODULES
 
 
 def get_registered_patch_descriptors() -> tuple[PatchDescriptor, ...]:
@@ -208,7 +188,7 @@ def apply_patch_descriptors(descriptors: Sequence[PatchDescriptor]) -> None:
             continue
 
         logger.debug(
-            "Enabling registry-managed patch %s (owner=%s, target=%s)",
+            "Applying RBLN patch %s (owner=%s, target=%s)",
             descriptor.key,
             descriptor.owner_module,
             descriptor.target,
@@ -225,24 +205,12 @@ def apply_registered_patches() -> None:
     apply_patch_descriptors(get_registered_patch_descriptors())
 
 
-def import_legacy_patch_modules() -> None:
-    global _legacy_patch_modules_loaded
-
-    if _legacy_patch_modules_loaded:
-        return
-
-    _import_modules(_LEGACY_PATCH_MODULES, kind="legacy patch")
-    _legacy_patch_modules_loaded = True
-
-
 __all__ = (
     "PatchDescriptor",
     "apply_patch_descriptors",
     "apply_registered_patches",
     "get_general_extension_modules",
-    "get_legacy_patch_modules",
     "get_registered_patch_descriptors",
-    "import_legacy_patch_modules",
     "register_general_extensions",
     "register_patch",
 )

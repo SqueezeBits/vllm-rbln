@@ -17,9 +17,7 @@ from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
     apply_registered_patches,
     get_general_extension_modules,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
-    import_legacy_patch_modules,
     register_general_extensions,
     register_patch,
 )
@@ -53,9 +51,7 @@ __all__ = (
     "apply_patch_descriptors",
     "apply_registered_patches",
     "get_general_extension_modules",
-    "get_legacy_patch_modules",
     "get_registered_patch_descriptors",
-    "import_legacy_patch_modules",
     "register_general_extensions",
     "register_patch",
 )

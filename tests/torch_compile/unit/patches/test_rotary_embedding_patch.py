@@ -18,7 +18,6 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 from vllm_rbln.patches.rotary_embedding import (
@@ -45,13 +44,6 @@ def _get_rotary_embedding_descriptors():
 def test_rotary_embedding_patch_descriptors_are_registry_managed():
     descriptors = _get_rotary_embedding_descriptors()
 
-    assert "vllm_rbln.model_executor.layers.rotary_embedding.base" not in (
-        get_legacy_patch_modules()
-    )
-    assert (
-        "vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope"
-        not in get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.rotary_embedding.base.RotaryEmbedding.__init__",
         "vllm.model_executor.layers.rotary_embedding.base.RotaryEmbedding.forward_oot",

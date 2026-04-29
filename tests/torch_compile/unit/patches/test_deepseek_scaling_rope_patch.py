@@ -23,7 +23,6 @@ from vllm_rbln.patches.deepseek_scaling_rope import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -46,10 +45,6 @@ def _get_deepseek_scaling_rope_descriptors():
 def test_deepseek_scaling_rope_patch_descriptor_is_registry_managed():
     descriptors = _get_deepseek_scaling_rope_descriptors()
 
-    assert (
-        "vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope"
-        not in get_legacy_patch_modules()
-    )
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope.DeepseekScalingRotaryEmbedding.forward",  # noqa: E501
     }

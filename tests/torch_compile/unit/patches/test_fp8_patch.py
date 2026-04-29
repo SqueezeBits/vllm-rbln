@@ -21,7 +21,6 @@ from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
     get_general_extension_modules,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -50,7 +49,6 @@ def test_fp8_custom_op_module_is_registered_as_general_extension():
     custom_op_module = "vllm_rbln.model_executor.layers.quantization.fp8"
 
     assert custom_op_module in get_general_extension_modules()
-    assert custom_op_module not in get_legacy_patch_modules()
 
 
 def test_fp8_patch_descriptors_are_registry_managed():

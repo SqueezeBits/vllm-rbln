@@ -21,7 +21,6 @@ from vllm_rbln.patches.models_qwen2_moe import (
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
-    get_legacy_patch_modules,
     get_registered_patch_descriptors,
 )
 
@@ -44,7 +43,6 @@ def _get_qwen2_moe_descriptors():
 def test_qwen2_moe_patch_descriptor_is_registry_managed():
     descriptors = _get_qwen2_moe_descriptors()
 
-    assert "vllm_rbln.models.qwen2_moe" not in get_legacy_patch_modules()
     assert {descriptor.target for descriptor in descriptors} == {
         "vllm.model_executor.models.qwen2_moe.Qwen2MoeSparseMoeBlock.forward",
     }

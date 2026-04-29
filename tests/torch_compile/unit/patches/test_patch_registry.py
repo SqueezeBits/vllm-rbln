@@ -21,7 +21,6 @@ def reset_patch_registry_state(monkeypatch):
 
     monkeypatch.setattr(patch_registry, "_applied_patch_keys", set())
     monkeypatch.setattr(patch_registry, "_general_extensions_loaded", False)
-    monkeypatch.setattr(patch_registry, "_legacy_patch_modules_loaded", False)
 
 
 def _build_descriptor(*, key: str, owner_module: str, target: str | None = None):
@@ -36,24 +35,19 @@ def _build_descriptor(*, key: str, owner_module: str, target: str | None = None)
     )
 
 
-def test_patch_registry_splits_general_extensions_from_legacy_patches():
+def test_patch_registry_separates_general_extensions_from_patch_descriptors():
     from vllm_rbln.patches.patch_registry import (
         get_general_extension_modules,
-        get_legacy_patch_modules,
     )
 
     general_extensions = set(get_general_extension_modules())
-    legacy_patches = set(get_legacy_patch_modules())
 
     assert "vllm_rbln.distributed.kv_transfer.kv_connector.factory" in (
         general_extensions
     )
-    assert "vllm_rbln.model_executor.layers.attention.attention" not in legacy_patches
-    assert "vllm_rbln.model_executor.layers.fused_moe.layer" not in legacy_patches
     assert "vllm_rbln.model_executor.layers.fused_moe.custom_ops" in (
         general_extensions
     )
-    assert general_extensions.isdisjoint(legacy_patches)
 
 
 def test_apply_patch_descriptors_is_idempotent(monkeypatch):
@@ -91,17 +85,10 @@ def test_apply_patch_descriptors_is_idempotent(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("general_extensions", "legacy_patches", "descriptors", "message"),
+    ("general_extensions", "descriptors", "message"),
     [
         (
-            ("shared.module",),
-            ("shared.module",),
-            (),
-            "general extension modules and legacy patch modules must be disjoint",
-        ),
-        (
             ("general.module",),
-            (),
             (
                 _build_descriptor(
                     key="duplicate.key",
@@ -117,7 +104,6 @@ def test_apply_patch_descriptors_is_idempotent(monkeypatch):
         ),
         (
             ("general.module",),
-            (),
             (
                 _build_descriptor(
                     key="patch.key.one",
@@ -132,32 +118,19 @@ def test_apply_patch_descriptors_is_idempotent(monkeypatch):
         ),
         (
             ("owner.module",),
-            (),
             (
                 _build_descriptor(
                     key="patch.key",
                     owner_module="owner.module",
                 ),
             ),
-            "registry-managed patch owner module must not be listed as a general extension: owner.module",  # noqa: E501
-        ),
-        (
-            (),
-            ("owner.module",),
-            (
-                _build_descriptor(
-                    key="patch.key",
-                    owner_module="owner.module",
-                ),
-            ),
-            "registry-managed patch owner module must not remain in the legacy path: owner.module",  # noqa: E501
+            "patch owner module must not be listed as a general extension: owner.module",  # noqa: E501
         ),
     ],
 )
 def test_validate_registry_layout_rejects_invalid_configs(
     monkeypatch,
     general_extensions,
-    legacy_patches,
     descriptors,
     message,
 ):
@@ -166,7 +139,6 @@ def test_validate_registry_layout_rejects_invalid_configs(
     monkeypatch.setattr(
         patch_registry, "_GENERAL_EXTENSION_MODULES", general_extensions
     )
-    monkeypatch.setattr(patch_registry, "_LEGACY_PATCH_MODULES", legacy_patches)
     monkeypatch.setattr(
         patch_registry, "_REGISTERED_PATCH_DESCRIPTORS", list(descriptors)
     )
@@ -260,25 +232,6 @@ def test_register_general_extensions_imports_only_once(monkeypatch):
     assert imported == [modules]
 
 
-def test_import_legacy_patch_modules_imports_only_once(monkeypatch):
-    import vllm_rbln.patches.patch_registry as patch_registry
-
-    imported: list[tuple[str, ...]] = []
-    modules = ("legacy.one", "legacy.two")
-
-    monkeypatch.setattr(patch_registry, "_LEGACY_PATCH_MODULES", modules)
-    monkeypatch.setattr(
-        patch_registry,
-        "_import_modules",
-        lambda module_names, *, kind: imported.append(tuple(module_names)),
-    )
-
-    patch_registry.import_legacy_patch_modules()
-    patch_registry.import_legacy_patch_modules()
-
-    assert imported == [modules]
-
-
 def test_apply_patch_descriptors_logs_when_patch_is_enabled(monkeypatch):
     import vllm_rbln.patches.patch_registry as patch_registry
     from vllm_rbln.patches.patch_registry import (
@@ -306,7 +259,7 @@ def test_apply_patch_descriptors_logs_when_patch_is_enabled(monkeypatch):
 
     assert debug_calls == [
         (
-            "Enabling registry-managed patch %s (owner=%s, target=%s)",
+            "Applying RBLN patch %s (owner=%s, target=%s)",
             (
                 "test.patch_registry.logging",
                 "tests.patch_registry.logging",
@@ -340,31 +293,4 @@ def test_register_general_extensions_logs_when_modules_are_loaded(monkeypatch):
     assert debug_calls == [
         ("Enabling %s via module import: %s", ("general extension", "general.one")),
         ("Enabling %s via module import: %s", ("general extension", "general.two")),
-    ]
-
-
-def test_import_legacy_patch_modules_logs_when_modules_are_loaded(monkeypatch):
-    import vllm_rbln.patches.patch_registry as patch_registry
-
-    modules = ("legacy.one", "legacy.two")
-    debug_calls: list[tuple[str, tuple[object, ...]]] = []
-
-    monkeypatch.setattr(patch_registry, "_LEGACY_PATCH_MODULES", modules)
-    monkeypatch.setattr(
-        patch_registry,
-        "_legacy_patch_modules_loaded",
-        False,
-    )
-    monkeypatch.setattr(patch_registry, "import_module", lambda module_name: None)
-    monkeypatch.setattr(
-        patch_registry.logger,
-        "debug",
-        lambda message, *args: debug_calls.append((message, args)),
-    )
-
-    patch_registry.import_legacy_patch_modules()
-
-    assert debug_calls == [
-        ("Enabling %s via module import: %s", ("legacy patch", "legacy.one")),
-        ("Enabling %s via module import: %s", ("legacy patch", "legacy.two")),
     ]

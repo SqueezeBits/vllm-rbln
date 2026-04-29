@@ -49,10 +49,8 @@ def register_ops():
         import vllm_rbln.patches  # noqa: F401
         from vllm_rbln.patches.patch_registry import (
             apply_registered_patches,
-            import_legacy_patch_modules,
             register_general_extensions,
         )
 
         register_general_extensions()
         apply_registered_patches()
-        import_legacy_patch_modules()
