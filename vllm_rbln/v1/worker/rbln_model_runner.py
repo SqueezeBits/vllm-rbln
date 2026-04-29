@@ -38,7 +38,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
-from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
@@ -120,7 +119,7 @@ from vllm.v1.worker.utils import (
 
 import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
-from vllm_rbln.forward_context import RBLNDPMetadata
+from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask

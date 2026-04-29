@@ -36,6 +36,15 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+# NOTE(RBLN): This context manager originated from
+# https://github.com/RBLN-SW/vllm-rbln/commit/58577d6 while adding MoE PoC
+# support, and was later updated through
+# https://github.com/RBLN-SW/vllm-rbln/pull/192,
+# https://github.com/RBLN-SW/vllm-rbln/pull/252,
+# https://github.com/RBLN-SW/vllm-rbln/pull/293,
+# https://github.com/RBLN-SW/vllm-rbln/commit/191b133, and
+# https://github.com/RBLN-SW/vllm-rbln/pull/524.
+
 
 @dataclass
 class RBLNDPMetadata(DPMetadata):
@@ -128,7 +137,7 @@ class RBLNDPMetadata(DPMetadata):
 
 
 @contextmanager
-def _set_forward_context(
+def set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     virtual_engine: int = 0,
