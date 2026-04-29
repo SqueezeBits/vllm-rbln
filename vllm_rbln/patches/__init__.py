@@ -43,6 +43,7 @@ from . import (
     models_utils,  # noqa: F401
     mxfp4,  # noqa: F401
     rotary_embedding,  # noqa: F401
+    shared_fused_moe,  # noqa: F401
     vocab_parallel_embedding,  # noqa: F401
 )
 
