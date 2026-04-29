@@ -12,6 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.model_executor.layers.attention import Attention
-
-__all__ = ["Attention"]
+# RBLN attention patch implementations live in attention.py and are registered
+# by vllm_rbln.patches.attention. Use upstream vLLM Attention directly.
