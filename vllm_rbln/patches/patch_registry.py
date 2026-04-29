@@ -84,6 +84,7 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
     "vllm_rbln.triton_kernels.flash_attention",
     "vllm_rbln.triton_kernels.flash_causal_attention",
     "vllm_rbln.triton_kernels.sliding_window_attention",
+    "vllm_rbln.model_executor.layers.fused_moe.custom_ops",
     "vllm_rbln.model_executor.layers.quantization.mxfp4",
     "vllm_rbln.model_executor.layers.quantization.fp8",
 )
@@ -91,9 +92,7 @@ _GENERAL_EXTENSION_MODULES: tuple[str, ...] = (
 
 # NOTE: These modules still patch upstream symbols at import time. They remain
 # on the legacy path until each cluster is migrated to explicit descriptors.
-_LEGACY_PATCH_MODULES: tuple[str, ...] = (
-    "vllm_rbln.model_executor.layers.fused_moe.layer",
-)
+_LEGACY_PATCH_MODULES: tuple[str, ...] = ()
 
 _applied_patch_keys: set[str] = set()
 _general_extensions_loaded = False

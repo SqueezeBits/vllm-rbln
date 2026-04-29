@@ -49,7 +49,10 @@ def test_patch_registry_splits_general_extensions_from_legacy_patches():
         general_extensions
     )
     assert "vllm_rbln.model_executor.layers.attention.attention" not in legacy_patches
-    assert "vllm_rbln.model_executor.layers.fused_moe.layer" in legacy_patches
+    assert "vllm_rbln.model_executor.layers.fused_moe.layer" not in legacy_patches
+    assert "vllm_rbln.model_executor.layers.fused_moe.custom_ops" in (
+        general_extensions
+    )
     assert general_extensions.isdisjoint(legacy_patches)
 
 

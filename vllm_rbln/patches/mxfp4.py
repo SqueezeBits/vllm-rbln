@@ -213,7 +213,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             tokens_mask = None
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
-                from vllm_rbln.model_executor.layers.fused_moe.layer import (
+                from vllm_rbln.model_executor.layers.fused_moe.utils import (
                     get_tokens_mask,
                 )
 
