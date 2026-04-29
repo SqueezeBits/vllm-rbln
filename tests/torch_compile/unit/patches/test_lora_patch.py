@@ -16,9 +16,9 @@ import pytest
 from vllm.lora.layers import VocabParallelEmbeddingWithLoRA
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
-from vllm_rbln.patches.lora import (
-    base_linear_patched_apply,
-    vocab_parallel_embedding_patched_forward,
+from vllm_rbln.lora.layers import patched_vocab_parallel_embedding_with_lora_forward
+from vllm_rbln.lora.layers.base_linear import (
+    patched_base_linear_apply,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -67,10 +67,10 @@ def test_lora_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_lora_descriptors())
 
-    assert BaseLinearLayerWithLoRA.apply is base_linear_patched_apply
+    assert BaseLinearLayerWithLoRA.apply is patched_base_linear_apply
     assert (
         VocabParallelEmbeddingWithLoRA.forward
-        is vocab_parallel_embedding_patched_forward
+        is patched_vocab_parallel_embedding_with_lora_forward
     )
 
 

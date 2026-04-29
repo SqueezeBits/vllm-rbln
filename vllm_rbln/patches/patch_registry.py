@@ -46,6 +46,7 @@ def register_patch(
     target: str,
     reason: str,
     key: str | None = None,
+    owner_module: str | None = None,
     condition: Callable[[], bool] | None = None,
     verify: Callable[[], None] | None = None,
     priority: int = DEFAULT_PATCH_PRIORITY,
@@ -56,7 +57,10 @@ def register_patch(
         target: Fully qualified upstream symbol path to replace.
         reason: Human-readable explanation for why the patch is required.
         key: Optional stable descriptor key. If omitted, the replacement's
-            module and qualified name are used.
+            owner module and qualified name are used.
+        owner_module: Optional descriptor owner module. Use this when the
+            descriptor registration lives in a different module from the
+            replacement implementation. Defaults to the replacement's module.
         condition: Optional predicate evaluated at apply time. The patch is
             skipped when the predicate returns ``False``.
         verify: Optional callback that validates the patch after assignment.
@@ -78,7 +82,8 @@ def register_patch(
             "__qualname__",
             replacement.__name__,
         )
-        descriptor_key = key or (f"{replacement.__module__}.{replacement_name}")
+        descriptor_owner_module = owner_module or replacement.__module__
+        descriptor_key = key or (f"{descriptor_owner_module}.{replacement_name}")
         for descriptor in _REGISTERED_PATCH_DESCRIPTORS:
             if descriptor.key == descriptor_key:
                 return replacement
@@ -86,7 +91,7 @@ def register_patch(
         _REGISTERED_PATCH_DESCRIPTORS.append(
             PatchDescriptor(
                 key=descriptor_key,
-                owner_module=replacement.__module__,
+                owner_module=descriptor_owner_module,
                 target=target,
                 replacement=replacement,
                 reason=reason,

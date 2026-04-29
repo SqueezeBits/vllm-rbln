@@ -15,8 +15,8 @@
 import pytest
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
 
-from vllm_rbln.patches.models_qwen3_moe import (
-    rbln_qwen3_moe_sparse_moe_block_forward,
+from vllm_rbln.model_executor.models.qwen3_moe import (
+    patched_qwen3_moe_sparse_moe_block_forward,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -56,7 +56,7 @@ def test_qwen3_moe_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_qwen3_moe_descriptors())
 
-    assert Qwen3MoeSparseMoeBlock.forward is rbln_qwen3_moe_sparse_moe_block_forward
+    assert Qwen3MoeSparseMoeBlock.forward is patched_qwen3_moe_sparse_moe_block_forward
 
 
 def test_qwen3_moe_patch_default_verify_rejects_missing_assignment(monkeypatch):

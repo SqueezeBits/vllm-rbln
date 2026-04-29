@@ -17,8 +17,8 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 
-from vllm_rbln.patches.deepseek_scaling_rope import (
-    deepseek_scaling_rotary_embedding_forward,
+from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    patched_deepseek_scaling_rotary_embedding_forward,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -60,7 +60,7 @@ def test_deepseek_scaling_rope_patch_descriptor_updates_target(monkeypatch):
 
     assert (
         DeepseekScalingRotaryEmbedding.forward
-        is deepseek_scaling_rotary_embedding_forward
+        is patched_deepseek_scaling_rotary_embedding_forward
     )
 
 

@@ -12,82 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import torch.nn.functional as F
-from vllm.lora.layers import VocabParallelEmbeddingWithLoRA
-from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
-
+from vllm_rbln.lora.layers import patched_vocab_parallel_embedding_with_lora_forward
+from vllm_rbln.lora.layers.base_linear import patched_base_linear_apply
 from vllm_rbln.patches.patch_registry import register_patch
 
-# NOTE(RBLN): This patch originated from
-# https://github.com/RBLN-SW/vllm-rbln/pull/169 while adding initial LoRA
-# support to the RBLN vLLM-model path.
-
-
-@register_patch(
+register_patch(
     target="vllm.lora.layers.base_linear.BaseLinearLayerWithLoRA.apply",
     reason=(
         "Adapt LoRA linear composition to the RBLN vLLM-model execution path, "
         "where the effective input/output tensor shapes differ from the "
         "upstream vLLM path."
     ),
-)
-def base_linear_patched_apply(
-    self: BaseLinearLayerWithLoRA, x: torch.Tensor, bias: torch.Tensor | None = None
-) -> torch.Tensor:
-    output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-    output_org_shape = output.shape
-
-    x = x.reshape(
-        -1, x.shape[-1]
-    )  # [bs, seq_len, hidden_size] -> [bs * seq_len, hidden_size]
-    output = output.reshape(
-        -1, output.shape[-1]
-    )  # [bs, seq_len, hidden_size] -> [bs * seq_len, hidden_size]
-
-    lora_output: torch.Tensor = self.punica_wrapper.add_lora_linear(
-        output, x, self.lora_a_stacked, self.lora_b_stacked, 1.0, self.output_slices
-    )
-
-    return lora_output.view(output_org_shape)
+    owner_module=__name__,
+)(patched_base_linear_apply)
 
 
-@register_patch(
+register_patch(
     target="vllm.lora.layers.VocabParallelEmbeddingWithLoRA.forward",
     reason=(
         "Adapt LoRA embedding composition to the RBLN vLLM-model execution "
         "path, where prefill/decode tensor shapes and Punica metadata layout "
         "differ from the upstream vLLM path."
     ),
-)
-def vocab_parallel_embedding_patched_forward(
-    self: VocabParallelEmbeddingWithLoRA, x: torch.Tensor
-) -> torch.Tensor:
-    # RBLN(NOTE): It assumes that the batch size of prefill phase is always 1.
-    is_prefill = x.shape[0] == 1
-    added_tokens_mask = torch.where(x > self.base_layer.org_vocab_size - 1, 1, 0)
-    num_tokens = x.size(1) if is_prefill else x.size(0)
-    indices_1 = self.punica_wrapper._embeddings_indices[1][:num_tokens]
-
-    if not is_prefill:
-        indices_1 = indices_1.unsqueeze(1)
-    full_lora_a_embeddings = F.embedding(
-        x + indices_1,
-        self.lora_a_stacked_2d,
-    )
-    full_output = self.base_layer.forward(x + (indices_1 * added_tokens_mask))
-
-    full_output_org = full_output
-    if full_output.ndim == 3:
-        full_output = full_output.view(full_output.shape[0] * full_output.shape[1], -1)
-    if full_lora_a_embeddings.ndim == 3:
-        full_lora_a_embeddings = full_lora_a_embeddings.view(
-            full_lora_a_embeddings.shape[0] * full_lora_a_embeddings.shape[1],
-            -1,
-        )
-
-    lora_output: torch.Tensor = self.punica_wrapper.add_lora_embedding(
-        full_output, full_lora_a_embeddings, self.lora_b_stacked, add_inputs=True
-    )
-
-    return lora_output.view_as(full_output_org)
+    owner_module=__name__,
+)(patched_vocab_parallel_embedding_with_lora_forward)

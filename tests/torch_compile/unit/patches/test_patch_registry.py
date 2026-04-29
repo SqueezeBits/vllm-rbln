@@ -42,6 +42,10 @@ def _build_descriptor(
     )
 
 
+def _patch_registry_replacement():
+    return None
+
+
 def test_patch_registry_separates_general_extensions_from_patch_descriptors():
     from vllm_rbln.patches.patch_registry import (
         get_general_extension_modules,
@@ -105,6 +109,25 @@ def test_patch_descriptors_sort_by_priority_then_key():
         "a.default",
         "b.default",
     ]
+
+
+def test_register_patch_uses_explicit_owner_module(monkeypatch):
+    import vllm_rbln.patches.patch_registry as patch_registry
+    from vllm_rbln.patches.patch_registry import register_patch
+
+    monkeypatch.setattr(patch_registry, "_REGISTERED_PATCH_DESCRIPTORS", [])
+
+    register_patch(
+        target="vllm_rbln.patches.patch_registry._TEST_PATCH_SLOT",
+        reason="test descriptor",
+        owner_module="tests.patch_owner",
+    )(_patch_registry_replacement)
+
+    descriptor = patch_registry.get_registered_patch_descriptors()[0]
+
+    assert descriptor.owner_module == "tests.patch_owner"
+    assert descriptor.key == "tests.patch_owner._patch_registry_replacement"
+    assert descriptor.replacement is _patch_registry_replacement
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,9 @@ from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
 )
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
@@ -32,7 +35,7 @@ from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 _upstream_init = Attention.__init__
 
 
-def _rbln_attention_init(self, *args, **kwargs) -> None:
+def patched_attention_init(self, *args, **kwargs) -> None:
     _upstream_init(self, *args, **kwargs)
 
     # NOTE(jiwoo.park) layer index is required to use external binding KV cache.
@@ -66,7 +69,8 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
     return attn_metadata.kv_caches[layer_index]
 
 
-def _rbln_unified_attention(
+@maybe_transfer_kv_layer
+def patched_unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -85,7 +89,8 @@ def _rbln_unified_attention(
     return output
 
 
-def _rbln_unified_attention_with_output(
+@maybe_transfer_kv_layer
+def patched_unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -120,7 +125,7 @@ def _rbln_unified_attention_with_output(
     )
 
 
-def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Block size may get updated after model loading, refresh it
     block_size = vllm_config.cache_config.block_size
     # Should not be called for enc-dec or encoder-only attention.

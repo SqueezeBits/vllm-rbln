@@ -15,7 +15,9 @@
 import pytest
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_rbln.patches.models_utils import auto_weights_loader_load_module
+from vllm_rbln.model_executor.models.utils import (
+    patched_auto_weights_loader_load_module,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -54,7 +56,7 @@ def test_models_utils_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_models_utils_descriptors())
 
-    assert AutoWeightsLoader._load_module is auto_weights_loader_load_module
+    assert AutoWeightsLoader._load_module is patched_auto_weights_loader_load_module
 
 
 def test_models_utils_patch_default_verify_rejects_missing_assignment(monkeypatch):

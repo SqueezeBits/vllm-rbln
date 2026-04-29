@@ -18,15 +18,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
+    patched_parallel_lm_head_tie_weights,
+    patched_vocab_parallel_embedding_forward,
+    patched_vocab_parallel_embedding_init,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
     get_registered_patch_descriptors,
-)
-from vllm_rbln.patches.vocab_parallel_embedding import (
-    parallel_lm_head_tie_weights,
-    vocab_parallel_embedding_forward,
-    vocab_parallel_embedding_init,
 )
 
 
@@ -71,9 +71,9 @@ def test_vocab_parallel_embedding_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_vocab_parallel_embedding_descriptors())
 
-    assert VocabParallelEmbedding.__init__ is vocab_parallel_embedding_init
-    assert VocabParallelEmbedding.forward is vocab_parallel_embedding_forward
-    assert ParallelLMHead.tie_weights is parallel_lm_head_tie_weights
+    assert VocabParallelEmbedding.__init__ is patched_vocab_parallel_embedding_init
+    assert VocabParallelEmbedding.forward is patched_vocab_parallel_embedding_forward
+    assert ParallelLMHead.tie_weights is patched_parallel_lm_head_tie_weights
 
 
 def test_vocab_parallel_embedding_patch_default_verify_rejects_missing_assignment(

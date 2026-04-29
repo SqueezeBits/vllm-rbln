@@ -21,14 +21,20 @@ from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeModel
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel
 
-from vllm_rbln.patches.load_weights import (
-    load_deepseek_v2_weights,
-    load_llama4_weights,
-    load_llama_weights,
-    load_minimax_m2_weights,
-    load_qwen2_weights,
-    load_qwen2moe_weights,
-    load_qwen3moe_weights,
+from vllm_rbln.model_executor.models.deepseek_v2 import (
+    patched_deepseek_v2_load_weights,
+)
+from vllm_rbln.model_executor.models.llama import patched_llama_load_weights
+from vllm_rbln.model_executor.models.llama4 import patched_llama4_load_weights
+from vllm_rbln.model_executor.models.minimax_m2 import (
+    patched_minimax_m2_load_weights,
+)
+from vllm_rbln.model_executor.models.qwen2 import patched_qwen2_load_weights
+from vllm_rbln.model_executor.models.qwen2_moe import (
+    patched_qwen2_moe_load_weights,
+)
+from vllm_rbln.model_executor.models.qwen3_moe import (
+    patched_qwen3_moe_load_weights,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -80,13 +86,13 @@ def test_load_weights_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_load_weights_descriptors())
 
-    assert LlamaModel.load_weights is load_llama_weights
-    assert Llama4Model.load_weights is load_llama4_weights
-    assert Qwen2Model.load_weights is load_qwen2_weights
-    assert Qwen2MoeModel.load_weights is load_qwen2moe_weights
-    assert Qwen3MoeModel.load_weights is load_qwen3moe_weights
-    assert DeepseekV2ForCausalLM.load_weights is load_deepseek_v2_weights
-    assert MiniMaxM2Model.load_weights is load_minimax_m2_weights
+    assert LlamaModel.load_weights is patched_llama_load_weights
+    assert Llama4Model.load_weights is patched_llama4_load_weights
+    assert Qwen2Model.load_weights is patched_qwen2_load_weights
+    assert Qwen2MoeModel.load_weights is patched_qwen2_moe_load_weights
+    assert Qwen3MoeModel.load_weights is patched_qwen3_moe_load_weights
+    assert DeepseekV2ForCausalLM.load_weights is patched_deepseek_v2_load_weights
+    assert MiniMaxM2Model.load_weights is patched_minimax_m2_load_weights
 
 
 def test_load_weights_patch_default_verify_rejects_missing_assignments(monkeypatch):

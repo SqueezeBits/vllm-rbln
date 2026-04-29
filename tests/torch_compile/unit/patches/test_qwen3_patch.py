@@ -15,7 +15,9 @@
 import pytest
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 
-from vllm_rbln.patches.models_qwen3 import rbln_qwen3_for_causal_lm_init
+from vllm_rbln.model_executor.models.qwen3 import (
+    patched_qwen3_for_causal_lm_init,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -54,7 +56,7 @@ def test_qwen3_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_qwen3_descriptors())
 
-    assert Qwen3ForCausalLM.__init__ is rbln_qwen3_for_causal_lm_init
+    assert Qwen3ForCausalLM.__init__ is patched_qwen3_for_causal_lm_init
 
 
 def test_qwen3_patch_default_verify_rejects_missing_assignment(monkeypatch):

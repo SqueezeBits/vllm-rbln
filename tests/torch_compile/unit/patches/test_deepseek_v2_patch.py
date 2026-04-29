@@ -18,9 +18,9 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 
-from vllm_rbln.patches.models_deepseek_v2 import (
-    rbln_deepseek_v2_attention_forward,
-    rbln_deepseek_v2_moe_forward,
+from vllm_rbln.model_executor.models.deepseek_v2 import (
+    patched_deepseek_v2_attention_forward,
+    patched_deepseek_v2_moe_forward,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -65,8 +65,8 @@ def test_deepseek_v2_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_deepseek_v2_descriptors())
 
-    assert DeepseekV2MoE.forward is rbln_deepseek_v2_moe_forward
-    assert DeepseekV2Attention.forward is rbln_deepseek_v2_attention_forward
+    assert DeepseekV2MoE.forward is patched_deepseek_v2_moe_forward
+    assert DeepseekV2Attention.forward is patched_deepseek_v2_attention_forward
 
 
 def test_deepseek_v2_patch_default_verify_rejects_missing_assignments(monkeypatch):

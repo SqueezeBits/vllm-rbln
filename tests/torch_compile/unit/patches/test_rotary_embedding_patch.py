@@ -15,14 +15,14 @@
 import pytest
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
+from vllm_rbln.model_executor.layers.rotary_embedding.base import (
+    patched_rope_forward_oot,
+    patched_rotary_embedding_init,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
     get_registered_patch_descriptors,
-)
-from vllm_rbln.patches.rotary_embedding import (
-    rope_forward_oot,
-    rotary_embedding_init,
 )
 
 
@@ -62,8 +62,8 @@ def test_rotary_embedding_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_rotary_embedding_descriptors())
 
-    assert RotaryEmbedding.__init__ is rotary_embedding_init
-    assert RotaryEmbedding.forward_oot is rope_forward_oot
+    assert RotaryEmbedding.__init__ is patched_rotary_embedding_init
+    assert RotaryEmbedding.forward_oot is patched_rope_forward_oot
 
 
 def test_rotary_embedding_patch_default_verify_rejects_missing_assignment(monkeypatch):

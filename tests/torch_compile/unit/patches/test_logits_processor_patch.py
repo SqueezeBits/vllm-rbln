@@ -16,9 +16,9 @@ import pytest
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 import vllm_rbln.rbln_envs as envs
-from vllm_rbln.patches.logits_processor import (
-    logits_processor_gather_logits,
-    logits_processor_get_logits,
+from vllm_rbln.model_executor.layers.logits_processor import (
+    patched_gather_logits,
+    patched_get_logits,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -64,8 +64,8 @@ def test_logits_processor_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_logits_descriptors())
 
-    assert LogitsProcessor._get_logits is logits_processor_get_logits
-    assert LogitsProcessor._gather_logits is logits_processor_gather_logits
+    assert LogitsProcessor._get_logits is patched_get_logits
+    assert LogitsProcessor._gather_logits is patched_gather_logits
 
 
 def test_logits_processor_patch_is_disabled_when_all_gather_enabled(monkeypatch):

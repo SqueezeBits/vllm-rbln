@@ -17,6 +17,7 @@ from importlib import import_module
 import pytest
 import vllm.model_executor.kernels.linear as linear
 
+from vllm_rbln.model_executor.kernels.linear import patched_choose_mp_linear_kernel
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -53,8 +54,6 @@ def test_linear_kernel_chooser_patch_descriptor_is_registry_managed():
 
 
 def test_linear_kernel_chooser_patch_descriptor_updates_target(monkeypatch):
-    linear_kernel_chooser = _get_linear_kernel_chooser_module()
-
     def original_choose_mp_linear_kernel(*args, **kwargs):
         return args, kwargs
 
@@ -66,9 +65,7 @@ def test_linear_kernel_chooser_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_linear_kernel_chooser_descriptors())
 
-    assert linear.choose_mp_linear_kernel is (
-        linear_kernel_chooser.choose_mp_linear_kernel_rbln
-    )
+    assert linear.choose_mp_linear_kernel is patched_choose_mp_linear_kernel
 
 
 def test_linear_kernel_chooser_patch_default_verify_rejects_missing_assignment(

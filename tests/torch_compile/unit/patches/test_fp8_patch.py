@@ -17,6 +17,10 @@ from importlib import import_module
 import pytest
 import vllm.model_executor.layers.quantization.fp8 as upstream_fp8
 
+from vllm_rbln.model_executor.layers.quantization.fp8 import (
+    PatchedFp8LinearMethod,
+    PatchedFp8MoEMethod,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -61,8 +65,6 @@ def test_fp8_patch_descriptors_are_registry_managed():
 
 
 def test_fp8_patch_descriptors_update_targets(monkeypatch):
-    fp8_patch = _get_fp8_patch_module()
-
     class OriginalFp8LinearMethod:
         pass
 
@@ -82,8 +84,8 @@ def test_fp8_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_fp8_descriptors())
 
-    assert upstream_fp8.Fp8LinearMethod is fp8_patch.Fp8LinearMethod
-    assert upstream_fp8.Fp8MoEMethod is fp8_patch.Fp8MoEMethod
+    assert upstream_fp8.Fp8LinearMethod is PatchedFp8LinearMethod
+    assert upstream_fp8.Fp8MoEMethod is PatchedFp8MoEMethod
 
 
 def test_fp8_patch_default_verify_rejects_missing_assignments(monkeypatch):

@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.models.qwen3_moe import Qwen3MoeSparseMoeBlock
-
+from vllm_rbln.model_executor.models.qwen3_moe import (
+    patched_qwen3_moe_sparse_moe_block_forward,
+)
 from vllm_rbln.patches.patch_registry import register_patch
 
-# NOTE(RBLN): This patch originated from
-# https://github.com/RBLN-SW/vllm-rbln/commit/d6c5ec8960a6108e94698b71191e12e887c09184
-# and its active router/shared-output behavior was updated in
-# https://github.com/RBLN-SW/vllm-rbln/pull/367 and
-# https://github.com/RBLN-SW/vllm-rbln/pull/511.
-
-
-@register_patch(
+register_patch(
     target="vllm.model_executor.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward",
     reason=(
         "The RBLN path needs Qwen3MoE blocks to route experts through the "
@@ -35,20 +27,5 @@ from vllm_rbln.patches.patch_registry import register_patch
         "sequence-parallel and TP reduction rules that do not match the "
         "RBLN fused-MoE execution contract."
     ),
-)
-def rbln_qwen3_moe_sparse_moe_block_forward(
-    self: Qwen3MoeSparseMoeBlock,
-    hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    # RBLN fused-MoE keeps the original token layout and expects router
-    # computation to happen inside the patched expert path.
-    shared_out, fused_out = self.experts(
-        hidden_states=hidden_states,
-        router=lambda x: self.gate(x)[0],
-    )
-    final_hidden_states = (
-        shared_out + fused_out if shared_out is not None else fused_out
-    )
-    if self.tp_size > 1:
-        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-    return final_hidden_states
+    owner_module=__name__,
+)(patched_qwen3_moe_sparse_moe_block_forward)

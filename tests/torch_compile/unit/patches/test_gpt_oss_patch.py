@@ -15,9 +15,9 @@
 import pytest
 from vllm.model_executor.models.gpt_oss import GptOssModel, MLPBlock
 
-from vllm_rbln.patches.models_gpt_oss import (
-    rbln_gpt_oss_load_weights_mxfp4,
-    rbln_gpt_oss_mlp_block_forward,
+from vllm_rbln.model_executor.models.gpt_oss import (
+    patched_gpt_oss_load_weights_mxfp4,
+    patched_gpt_oss_mlp_block_forward,
 )
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
@@ -62,8 +62,8 @@ def test_gpt_oss_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_gpt_oss_descriptors())
 
-    assert GptOssModel._load_weights_mxfp4 is rbln_gpt_oss_load_weights_mxfp4
-    assert MLPBlock.forward is rbln_gpt_oss_mlp_block_forward
+    assert GptOssModel._load_weights_mxfp4 is patched_gpt_oss_load_weights_mxfp4
+    assert MLPBlock.forward is patched_gpt_oss_mlp_block_forward
 
 
 def test_gpt_oss_patch_default_verify_rejects_missing_assignments(monkeypatch):

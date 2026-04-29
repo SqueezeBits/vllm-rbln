@@ -12,22 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
-from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
-
+from vllm_rbln.model_executor.models.qwen3 import patched_qwen3_for_causal_lm_init
 from vllm_rbln.patches.patch_registry import register_patch
 
-# NOTE(RBLN): This patch originated from
-# https://github.com/RBLN-SW/vllm-rbln/pull/145 while carrying Qwen3 model
-# support into the RBLN vLLM-model path.
-
-qwen3_for_causal_lm_original_init = Qwen3ForCausalLM.__init__
-
-
-@register_patch(
+register_patch(
     target="vllm.model_executor.models.qwen3.Qwen3ForCausalLM.__init__",
     reason=(
         "The RBLN path needs dense Qwen3 models to initialize a "
@@ -35,25 +23,5 @@ qwen3_for_causal_lm_original_init = Qwen3ForCausalLM.__init__
         "because token embeddings stay non-tensor-parallel while the LM "
         "head must remain tensor-parallel sharded."
     ),
-)
-def rbln_qwen3_for_causal_lm_init(
-    self: Qwen3ForCausalLM,
-    vllm_config: VllmConfig,
-    prefix: str = "",
-):
-    qwen3_for_causal_lm_original_init(self, vllm_config=vllm_config, prefix=prefix)
-    config = self.config
-    quant_config = self.quant_config
-
-    if get_pp_group().is_last_rank:
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-
-        if config.tie_word_embeddings:
-            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-    else:
-        self.lm_head = PPMissingLayer()
+    owner_module=__name__,
+)(patched_qwen3_for_causal_lm_init)

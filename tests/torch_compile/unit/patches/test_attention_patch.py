@@ -19,6 +19,12 @@ import pytest
 import vllm.model_executor.layers.attention.attention as upstream_attention
 from vllm.model_executor.layers.attention.attention import Attention
 
+from vllm_rbln.model_executor.layers.attention.attention import (
+    patched_attention_init,
+    patched_get_kv_cache_spec,
+    patched_unified_attention,
+    patched_unified_attention_with_output,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -58,8 +64,6 @@ def test_attention_patch_descriptors_are_registry_managed():
 
 
 def test_attention_patch_descriptors_update_targets(monkeypatch):
-    attention_patch = _get_attention_patch_module()
-
     def original_unified_attention(*args, **kwargs):
         return args, kwargs
 
@@ -87,24 +91,17 @@ def test_attention_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_attention_descriptors())
 
-    assert (
-        upstream_attention.unified_attention is attention_patch.rbln_unified_attention
-    )
+    assert upstream_attention.unified_attention is patched_unified_attention
     assert upstream_attention.unified_attention_with_output is (
-        attention_patch.rbln_unified_attention_with_output
+        patched_unified_attention_with_output
     )
-    assert Attention.__init__ is attention_patch.rbln_attention_init
-    assert Attention.get_kv_cache_spec is attention_patch.rbln_get_kv_cache_spec
+    assert Attention.__init__ is patched_attention_init
+    assert Attention.get_kv_cache_spec is patched_get_kv_cache_spec
 
 
 def test_attention_transfer_wrappers_preserve_layer_name_signature():
-    attention_patch = _get_attention_patch_module()
-
-    assert "layer_name" in signature(attention_patch.rbln_unified_attention).parameters
-    assert (
-        "layer_name"
-        in signature(attention_patch.rbln_unified_attention_with_output).parameters
-    )
+    assert "layer_name" in signature(patched_unified_attention).parameters
+    assert "layer_name" in signature(patched_unified_attention_with_output).parameters
 
 
 def test_attention_patch_default_verify_rejects_missing_assignments(monkeypatch):

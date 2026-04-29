@@ -12,20 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from vllm.distributed import (
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_gather,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
 import vllm_rbln.rbln_envs as envs
+from vllm_rbln.model_executor.layers.logits_processor import (
+    patched_gather_logits,
+    patched_get_logits,
+)
 from vllm_rbln.patches.patch_registry import register_patch
 
-# NOTE(RBLN): This patch originated from https://github.com/RBLN-SW/vllm-rbln/pull/81
-
-
-@register_patch(
+register_patch(
     target="vllm.model_executor.layers.logits_processor.LogitsProcessor._get_logits",
     reason=(
         "The RBLN TP logits path needs local LM-head execution to remain "
@@ -34,18 +28,11 @@ from vllm_rbln.patches.patch_registry import register_patch
         "VLLM_RBLN_LOGITS_ALL_GATHER is disabled."
     ),
     condition=lambda: not envs.VLLM_RBLN_LOGITS_ALL_GATHER,
-)
-def logits_processor_get_logits(
-    self,
-    hidden_states: torch.Tensor,
-    lm_head: VocabParallelEmbedding,
-    embedding_bias: torch.Tensor | None,
-) -> torch.Tensor | None:
-    logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-    return logits
+    owner_module=__name__,
+)(patched_get_logits)
 
 
-@register_patch(
+register_patch(
     target="vllm.model_executor.layers.logits_processor.LogitsProcessor._gather_logits",
     reason=(
         "The RBLN TP logits path needs tensor-parallel gathering and "
@@ -54,14 +41,5 @@ def logits_processor_get_logits(
         "VLLM_RBLN_LOGITS_ALL_GATHER is disabled."
     ),
     condition=lambda: not envs.VLLM_RBLN_LOGITS_ALL_GATHER,
-)
-def logits_processor_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-    """gather/all-gather the logits tensor across model parallel group."""
-    if self.use_all_gather:
-        logits = tensor_model_parallel_all_gather(logits)
-    else:
-        logits = tensor_model_parallel_gather(logits)
-
-    if logits is not None:
-        logits = logits[..., : self.org_vocab_size]
-    return logits
+    owner_module=__name__,
+)(patched_gather_logits)

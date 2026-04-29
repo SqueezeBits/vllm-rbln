@@ -20,6 +20,12 @@ from vllm.model_executor.layers.fused_moe.layer import (
     UnquantizedFusedMoEMethod,
 )
 
+from vllm_rbln.model_executor.layers.fused_moe.layer import (
+    patched_fused_moe_forward_oot,
+    patched_fused_moe_init,
+    patched_fused_moe_naive_multicast,
+    patched_unquantized_fused_moe_method_apply,
+)
 from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
     get_general_extension_modules,
@@ -113,8 +119,6 @@ def test_fused_moe_patch_descriptors_precede_shared_fused_moe_descriptors():
 
 
 def test_fused_moe_patch_descriptors_update_targets(monkeypatch):
-    fused_moe_patch = _get_fused_moe_patch_module()
-
     def original_init(self, *args, **kwargs):
         return None
 
@@ -134,7 +138,7 @@ def test_fused_moe_patch_descriptors_update_targets(monkeypatch):
 
     apply_patch_descriptors(_get_fused_moe_descriptors())
 
-    assert FusedMoE.__init__ is fused_moe_patch.rbln_fused_moe_init
-    assert FusedMoE.forward_oot is fused_moe_patch.rbln_fused_moe_forward_oot
-    assert FusedMoE.naive_multicast is fused_moe_patch.rbln_fused_moe_naive_multicast
-    assert UnquantizedFusedMoEMethod.apply is fused_moe_patch.rbln_unquantized_apply
+    assert FusedMoE.__init__ is patched_fused_moe_init
+    assert FusedMoE.forward_oot is patched_fused_moe_forward_oot
+    assert FusedMoE.naive_multicast is patched_fused_moe_naive_multicast
+    assert UnquantizedFusedMoEMethod.apply is patched_unquantized_fused_moe_method_apply

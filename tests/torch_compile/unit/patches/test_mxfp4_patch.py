@@ -17,6 +17,7 @@ from importlib import import_module
 import pytest
 import vllm.model_executor.layers.quantization.mxfp4 as upstream_mxfp4
 
+from vllm_rbln.model_executor.layers.quantization.mxfp4 import PatchedMxfp4MoEMethod
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -60,8 +61,6 @@ def test_mxfp4_patch_descriptor_is_registry_managed():
 
 
 def test_mxfp4_patch_descriptor_updates_target(monkeypatch):
-    mxfp4_patch = _get_mxfp4_patch_module()
-
     class OriginalMxfp4MoEMethod:
         pass
 
@@ -73,7 +72,7 @@ def test_mxfp4_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_mxfp4_descriptors())
 
-    assert upstream_mxfp4.Mxfp4MoEMethod is mxfp4_patch.Mxfp4MoEMethod
+    assert upstream_mxfp4.Mxfp4MoEMethod is PatchedMxfp4MoEMethod
 
 
 def test_mxfp4_patch_default_verify_rejects_missing_assignment(monkeypatch):

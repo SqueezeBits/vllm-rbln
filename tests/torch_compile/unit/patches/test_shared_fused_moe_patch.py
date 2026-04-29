@@ -17,6 +17,10 @@ from importlib import import_module
 import pytest
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
+from vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe import (
+    patched_shared_fused_moe_forward_oot,
+    patched_shared_fused_moe_init,
+)
 from vllm_rbln.patches.patch_registry import (
     apply_patch_descriptors,
     get_registered_patch_descriptors,
@@ -85,8 +89,6 @@ def test_shared_fused_moe_patch_descriptors_are_registry_managed():
 
 
 def test_shared_fused_moe_patch_descriptors_update_targets():
-    shared_fused_moe_patch = _get_shared_fused_moe_patch_module()
-
     def original_init(self, *args, **kwargs):
         return None
 
@@ -102,8 +104,6 @@ def test_shared_fused_moe_patch_descriptors_update_targets():
 
     apply_patch_descriptors(_get_shared_fused_moe_descriptors())
 
-    assert SharedFusedMoE.__init__ is shared_fused_moe_patch.rbln_shared_fused_moe_init
-    assert SharedFusedMoE.forward_oot is (
-        shared_fused_moe_patch.rbln_shared_fused_moe_forward_oot
-    )
+    assert SharedFusedMoE.__init__ is patched_shared_fused_moe_init
+    assert SharedFusedMoE.forward_oot is patched_shared_fused_moe_forward_oot
     assert "forward" not in SharedFusedMoE.__dict__

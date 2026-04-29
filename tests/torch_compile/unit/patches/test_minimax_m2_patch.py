@@ -15,7 +15,9 @@
 import pytest
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2MoE
 
-from vllm_rbln.patches.models_minimax_m2 import rbln_minimax_m2_moe_forward
+from vllm_rbln.model_executor.models.minimax_m2 import (
+    patched_minimax_m2_moe_forward,
+)
 from vllm_rbln.patches.patch_registry import (
     _verify_target_patch,
     apply_patch_descriptors,
@@ -54,7 +56,7 @@ def test_minimax_m2_patch_descriptor_updates_target(monkeypatch):
 
     apply_patch_descriptors(_get_minimax_m2_descriptors())
 
-    assert MiniMaxM2MoE.forward is rbln_minimax_m2_moe_forward
+    assert MiniMaxM2MoE.forward is patched_minimax_m2_moe_forward
 
 
 def test_minimax_m2_patch_default_verify_rejects_missing_assignment(monkeypatch):
