@@ -37,6 +37,14 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     RBLNKVCacheManager,
     SubBlockMatch,
 )
+from vllm_rbln.v1.core.rbln_scheduler_policy import (
+    get_decode_batch_cap,
+    get_running_schedule_start_index,
+    is_prefill_request,
+    remove_scheduled_running_reqs_for_prefill,
+    trim_scheduled_tokens_to_spec_decode_cap,
+    update_spec_decode_cap,
+)
 
 logger = init_logger(__name__)
 
@@ -49,10 +57,6 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
-def is_prefill(request: Request) -> bool:
-    return request.num_computed_tokens < request.num_tokens - 1
-
-
 class RBLNScheduler(Scheduler):
     def __init__(
         self,
@@ -61,6 +65,11 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        # Decode buckets are compiled per pipeline stage.
+        self.decode_batch_cap = get_decode_batch_cap(
+            self.max_num_running_reqs,
+            self.vllm_config.parallel_config.pipeline_parallel_size,
+        )
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -105,15 +114,16 @@ class RBLNScheduler(Scheduler):
                     sub_block_size,
                 )
 
+    # Forked from vllm.v1.core.sched.scheduler.Scheduler.schedule.
+    # RBLN-specific differences:
+    # - Disable mixed prefill/decode batching.
+    # - Limit local prefill batch size to 1.
+    # - Limit decode batch size to max_num_seqs // pipeline_parallel_size.
+    # - Apply a batch-wide speculative decode cap at block boundaries.
+    # - Delay KV cache finalization until the schedule output is fixed.
+    # - Support sub-block prefix caching and KV cache copy operations.
+    # See NOTE(RBLN) comments for details.
     def schedule(self) -> RBLNSchedulerOutput:
-        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
-        # The only differences are:
-        # - Disable mixed batching
-        # - Limit prefill batch size to 1
-        # - Limit decode batch size to (max_num_seqs // pipeline_parallel_size)
-        # - Do not schedule spec tokens when they are across block boundaries
-        # Search for NOTE(RBLN) for details
-
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -158,14 +168,8 @@ class RBLNScheduler(Scheduler):
         spec_decode_cap = self.block_size
 
         # First, schedule the RUNNING requests.
-        # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
-        # batch size fixed to 1 if any prefill request is running there must be exactly
-        # one at the end of the list.
-        req_index = (
-            len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
-            else 0
-        )
+        # NOTE(RBLN): Prioritize a tail prefill over running decode requests.
+        req_index = get_running_schedule_start_index(self.running)
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -321,20 +325,13 @@ class RBLNScheduler(Scheduler):
                 # next step when applicable.
                 request.spec_token_ids = []
 
-            # NOTE(RBLN): Update spec_decode_cap with the tightest constraint
-            # for this request: remaining space in the current block and remaining
-            # tokens until max_model_len. Done here (after confirmed scheduling)
-            # so that only actually scheduled requests affect the cap, and
-            # num_new_tokens reflects all prior adjustments. Even single-token
-            # decode requests must constrain the cap because the runner pads all
-            # requests to max_spec_decode_len.
-            if not is_prefill(request):
-                tokens_used_in_block = request.num_computed_tokens % self.block_size
-                remaining_in_block = self.block_size - tokens_used_in_block
-                remaining_in_maxlen = self.max_model_len - request.num_computed_tokens
-                spec_decode_cap = min(
-                    remaining_in_block, remaining_in_maxlen, spec_decode_cap
-                )
+            # NOTE(RBLN): Tighten the batch-wide spec decode cap.
+            spec_decode_cap = update_spec_decode_cap(
+                request=request,
+                current_cap=spec_decode_cap,
+                block_size=self.block_size,
+                max_model_len=self.max_model_len,
+            )
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -351,48 +348,18 @@ class RBLNScheduler(Scheduler):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
-            # NOTE(RBLN): We restrict the decode batch size to
-            # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
-            # bubbles.
-            if len(scheduled_running_reqs) >= (
-                self.max_num_running_reqs
-                // self.vllm_config.parallel_config.pipeline_parallel_size
-            ):
+            # NOTE(RBLN): Keep per-step decode batch within compiled PP bucket.
+            if len(scheduled_running_reqs) >= self.decode_batch_cap:
                 break
 
-        # NOTE(RBLN): Retroactively apply spec_decode_cap to requests scheduled
-        # before the cap was tightened. Only needed when spec decode is active
-        # this step (scheduled_spec_decode_tokens non-empty), since that is when
-        # the runner pads all requests to max_spec_decode_len. A request processed
-        # earlier in the loop may have been allocated more tokens than
-        # spec_decode_cap allows; if left uncorrected, the runner would pad a
-        # constrained request up to that larger length, causing it to cross its
-        # block boundary.
+        # NOTE(RBLN): Re-trim earlier requests after the tightest cap is known.
         if spec_decode_cap < self.block_size and scheduled_spec_decode_tokens:
-            for req in scheduled_running_reqs:
-                req_id = req.request_id
-                old_n = num_scheduled_tokens[req_id]
-                if old_n <= spec_decode_cap:
-                    continue
-                new_n = spec_decode_cap
-
-                token_budget += old_n - new_n
-                num_scheduled_tokens[req_id] = new_n
-
-                # Re-trim spec tokens to match the reduced token count.
-                num_spec = (
-                    new_n
-                    + req.num_computed_tokens
-                    - req.num_tokens
-                    - req.num_output_placeholders
-                )
-                if num_spec > 0:
-                    if req_id in scheduled_spec_decode_tokens:
-                        scheduled_spec_decode_tokens[req_id] = (
-                            scheduled_spec_decode_tokens[req_id][:num_spec]
-                        )
-                else:
-                    scheduled_spec_decode_tokens.pop(req_id, None)
+            token_budget += trim_scheduled_tokens_to_spec_decode_cap(
+                scheduled_running_reqs=scheduled_running_reqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+                spec_decode_cap=spec_decode_cap,
+            )
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -410,7 +377,9 @@ class RBLNScheduler(Scheduler):
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
-            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
+            and not (
+                scheduled_running_reqs and is_prefill_request(scheduled_running_reqs[0])
+            )
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
@@ -746,23 +715,14 @@ class RBLNScheduler(Scheduler):
                     # because scheduled new request is added as decoding phase.
                     continue
 
-                # NOTE(RBLN): Reaching this point means that this request can now be
-                # added to the running batch. However, since we do not support mixed
-                # batching for now, we remove all currently scheduled running requests
-                # from the scheduler output and run only this prefill request for the
-                # current step. In the next step (or after this request’s prefill
-                # completes if it cannot finish within a single step) this request will
-                # be scheduled together with the other running requests in the decoding
-                # phase.
-                for req in scheduled_running_reqs:
-                    req_to_new_blocks.pop(req.request_id)
-                    num_scheduled_tokens.pop(req.request_id)
-                    req.spec_token_ids = scheduled_spec_decode_tokens.pop(
-                        req.request_id, []
-                    )
-                    scheduled_encoder_inputs.pop(req.request_id, None)
-
-                scheduled_running_reqs.clear()
+                # NOTE(RBLN): Remove tentative decode output for local prefill.
+                remove_scheduled_running_reqs_for_prefill(
+                    scheduled_running_reqs,
+                    req_to_new_blocks,
+                    num_scheduled_tokens,
+                    scheduled_spec_decode_tokens,
+                    scheduled_encoder_inputs,
+                )
                 token_budget = prefill_token_budget
 
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
@@ -796,20 +756,12 @@ class RBLNScheduler(Scheduler):
         # out running decodes) can adjust token counts without needing to undo
         # premature caching. Now that scheduling is finalized, cache blocks and
         # schedule sub-block indexing for all scheduled requests.
-        for req in itertools.chain(
-            scheduled_running_reqs, scheduled_new_reqs, scheduled_resumed_reqs
-        ):
-            self.kv_cache_manager.cache_blocks(
-                req,
-                # Cap at req.num_tokens to exclude unverified spec decode
-                # draft tokens, matching the upstream allocate_slots behavior.
-                min(
-                    req.num_computed_tokens + num_scheduled_tokens[req.request_id],
-                    req.num_tokens,
-                ),
-            )
-            if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
-                self.kv_cache_manager.schedule_sub_block_indexing(req)
+        self._finalize_delayed_cache_blocks(
+            scheduled_running_reqs,
+            scheduled_new_reqs,
+            scheduled_resumed_reqs,
+            num_scheduled_tokens,
+        )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -907,6 +859,33 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _finalize_delayed_cache_blocks(
+        self,
+        scheduled_running_reqs: list[Request],
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> None:
+        """Commit delayed KV cache blocks for the finalized scheduler output.
+
+        All RBLN ``allocate_slots`` calls use ``delay_cache_blocks=True`` so
+        scheduling decisions can still trim or remove requests before the KV
+        cache state is committed. Once the output is finalized, cache only the
+        verified token range and schedule sub-block indexing for RBLN KV cache.
+        """
+        for req in itertools.chain(
+            scheduled_running_reqs, scheduled_new_reqs, scheduled_resumed_reqs
+        ):
+            # Cap at req.num_tokens to exclude unverified spec decode draft
+            # tokens, matching the upstream allocate_slots behavior.
+            num_computed_tokens = min(
+                req.num_computed_tokens + num_scheduled_tokens[req.request_id],
+                req.num_tokens,
+            )
+            self.kv_cache_manager.cache_blocks(req, num_computed_tokens)
+            if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+                self.kv_cache_manager.schedule_sub_block_indexing(req)
 
     def update_from_output(
         self,
