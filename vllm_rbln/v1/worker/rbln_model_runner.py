@@ -40,9 +40,13 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
     supports_eagle3,
+    supports_mrope,
+    supports_realtime,
     supports_transcription,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -52,6 +56,11 @@ from vllm.model_executor.models.interfaces_base import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.multimodal.inputs import (
+    BatchedTensorInputs,
+    MultiModalKwargsItem,
+)
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
@@ -195,6 +204,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+# TODO(RBLN): Forked from upstream, but not yet synced with the current upstream version
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -209,6 +219,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+# NOTE(RBLN): RBLN-only state.
 class DummyRunState(NamedTuple):
     """Input state for dummy run."""
 
@@ -218,6 +229,8 @@ class DummyRunState(NamedTuple):
     positions: dict[int, torch.Tensor]
 
 
+# NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+# TODO(RBLN): Sync with the current upstream version.
 class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def __init__(
         self,
@@ -562,11 +575,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-    def _enable_performance_tracker(self):
-        if envs.VLLM_RBLN_METRICS:
-            self.performance_tracker = PerformanceTracker("MODEL")
-            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
-            self.e2e_performance_tracker = PerformanceTracker("E2E")
+    ###########################################################################
+    # Forked methods from upstream
+    ###########################################################################
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.max_model_len = max_model_len
+        if self.speculative_config:
+            draft_config = self.speculative_config.draft_model_config
+            if draft_config is None or draft_config.max_model_len is None:
+                self.effective_drafter_max_model_len = self.max_model_len
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -593,7 +611,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             with_numpy=numpy,
         )
 
-    def _init_model_kwargs(self, num_tokens: int):
+    def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
 
         if not self.is_pooling_model:
@@ -627,6 +645,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return model_kwargs
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
     def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -647,6 +666,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
 
+        # NOTE(RBLN): Unlike upstream GPUModelRunner, we do not call
+        # reorder_batch_to_split_decodes_and_prefills() here. The current
+        # RBLN path assumes a homogeneous batch phase and does not support
+        # mixed prefill/decode execution within the same batch.
         orig_indices = np.arange(len(self.input_batch.req_ids))
         sorted_order = np.argsort(
             self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
@@ -666,14 +689,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 src_dest_map[dst] = dst
                 dst = next_dst
 
-    # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         pass
 
-    # Note: used for model runner override.
     def _sync_device(self) -> None:
         pass
 
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -922,6 +945,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+    # TODO(RBLN): Forked and modified from upstream,
+    # but not yet synced with the current upstream version.
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
     ) -> None:
@@ -994,6 +1019,58 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return req_state
 
+    def _init_mrope_positions(self, req_state: CachedRequestState):
+        model = self.get_model()
+        assert supports_mrope(model), "M-RoPE support is not implemented."
+        assert req_state.prompt_token_ids is not None, (
+            "M-RoPE requires prompt_token_ids to be available."
+        )
+        mrope_model = cast(SupportsMRoPE, model)
+
+        req_state.mrope_positions, req_state.mrope_position_delta = (
+            mrope_model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                req_state.mm_features,
+            )
+        )
+
+    def _extract_mm_kwargs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> BatchedTensorInputs:
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return {}
+
+        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is not None:
+                    mm_kwargs.append((feature.modality, feature.data))
+
+        # Input all modalities at once
+        mm_kwargs_combined: BatchedTensorInputs = {}
+        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ):
+            mm_kwargs_combined.update(mm_kwargs_batch)
+
+        return mm_kwargs_combined
+
+    def _dummy_mm_kwargs(self, num_seqs: int) -> BatchedTensorInputs:
+        if not self.is_multimodal_raw_input_only_model:
+            return {}
+
+        mm_budget = self.mm_budget
+        assert mm_budget is not None
+
+        if not mm_budget.mm_max_toks_per_item:
+            return {}  # No tower modalities (embed-only mode)
+
+        dummy_modality = mm_budget.get_modality_with_max_tokens()
+        return self._get_mm_dummy_batch(dummy_modality, num_seqs)
+
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
@@ -1014,6 +1091,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return cu_num_tokens, arange
 
+    # TODO(RBLN): Forked and modified from upstream,
+    # but not yet synced with the current upstream version.
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1134,6 +1213,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
 
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version
     def _get_encoder_seq_lens(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1152,6 +1233,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return encoder_seq_lens
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
     def _prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1443,51 +1526,54 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp,
         )
 
-    def _compile_model(self, model):
-        TP = get_tp_group()
-        PP = get_pp_group()
-        DP = get_dp_group()
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
 
-        process_group_dict = {}
-        process_group_dict[TP.device_group.group_name] = TP.ranks
-        process_group_dict[TP.cpu_group.group_name] = TP.ranks
-        process_group_dict[PP.device_group.group_name] = PP.ranks
-        process_group_dict[PP.cpu_group.group_name] = PP.ranks
-        process_group_dict[DP.device_group.group_name] = DP.ranks
-        process_group_dict[DP.cpu_group.group_name] = DP.ranks
-
-        options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
-            "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "mode": "strict",
-            "_runtime_holder": self.runtime_holder,
-        }
-        if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            logger.info(
-                "Once the model is compiled for the first time, "
-                "the cached compiled binary will be reused."
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                req.prompt_token_ids, req.prompt_embeds
             )
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
-        # compile compute_logits
-        # FIXME(jiwoo.park): method assignment for torch.compile
-        self.compute_logits = torch.compile(  # type: ignore[method-assign]
-            self.compute_logits,
-            backend="rbln",
-            options=copy(options),
-            dynamic=False,
-        )
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
 
-        compiled_model = torch.compile(
-            model,
-            backend="rbln",
-            options=copy(options),
-            dynamic=False,
-        )
+            assert num_scheduled_tokens == prompt_part_len + completion_part_len
 
-        return compiled_model
+            if prompt_part_len > 0:
+                # prompt's mrope_positions are pre-computed
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + prompt_part_len
+                src_start = num_computed_tokens
+                src_end = num_computed_tokens + prompt_part_len
+
+                self.mrope_positions.cpu[:, dst_start:dst_end] = req.mrope_positions[
+                    :, src_start:src_end
+                ]
+                mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                # compute completion's mrope_positions on-the-fly
+                dst_start = mrope_pos_ptr
+                dst_end = mrope_pos_ptr + completion_part_len
+
+                assert req.mrope_position_delta is not None
+                MRotaryEmbedding.get_next_input_positions_tensor(
+                    out=self.mrope_positions.np,
+                    out_offset=dst_start,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
+
+                mrope_pos_ptr += completion_part_len
 
     def _calc_spec_decode_metadata(
         self,
@@ -1584,8 +1670,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             supported_tasks.append("transcription")
 
+        if supports_realtime(model):
+            supported_tasks.append("realtime")
+
         return supported_tasks
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         model = self.get_model()
         if not is_pooling_model(model):
@@ -1593,6 +1683,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         supported_tasks = list(model.pooler.get_supported_tasks())
 
+        # NOTE(RBLN): rbln-specific condition
         if self.scheduler_config.enable_chunked_prefill and "encode" in supported_tasks:
             supported_tasks.remove("encode")
 
@@ -1621,6 +1712,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return tuple(tasks)
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
     def sync_and_slice_intermediate_tensors(
         self,
         batch_size: int,
@@ -1659,56 +1751,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert sync_self, "RBLN execute = sync self(from input)"
             return IntermediateTensors({k: v for k, v in intermediate_tensors.items()})
 
-    def get_dp_padding(
-        self,
-        num_tokens: int,
-        batch_bucket_size: int | None,
-        num_padded_tokens: int | None = None,
-        is_prefill: bool = False,
-    ) -> tuple[int | None, int | None, torch.Tensor | None]:
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-
-        if dp_size == 1:
-            assert num_padded_tokens is None, (
-                "num_padded_tokens should not be applied for non-DP case"
-            )
-            return batch_bucket_size, num_padded_tokens, None
-
-        if num_padded_tokens is not None:
-            assert self.specialized_moe_decode, (
-                "num_padded_tokens is only supported when "
-                "specialized MOE decode is enabled"
-            )
-            assert num_padded_tokens == self.max_num_batched_tokens, (
-                "num_padded_tokens should be equal to max_num_batched_tokens"
-            )
-            assert not is_prefill, (
-                "num_padded_tokens is only supported for decode stage"
-            )
-            num_tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
-                num_tokens, dp_size, dp_rank
-            )
-            return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu)
-
-        num_tokens_across_dp_cpu, max_decode_tokens = (
-            RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
-                num_tokens, dp_size, dp_rank, is_prefill
-            )
-        )
-
-        any_prefill = max_decode_tokens is None
-        if any_prefill or not self.specialized_moe_decode:
-            num_padded_tokens = self.max_num_batched_tokens
-        else:
-            assert max_decode_tokens is not None
-            batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
-                max_decode_tokens
-            )
-            num_padded_tokens = batch_bucket_size
-
-        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
-
+    # NOTE(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version.
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -1722,6 +1766,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         hidden_states = hidden_states[:num_scheduled_tokens]
         seq_lens_cpu = self.seq_lens.cpu[: self.input_batch.num_reqs]
+
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
             num_scheduled_tokens_np,
@@ -1751,6 +1796,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
         )
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1790,7 +1837,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             input_ids = None
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = {
-                **self._init_model_kwargs(num_scheduled_tokens),
+                **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
         else:
@@ -1800,7 +1847,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # then the embedding layer is not included in the CUDA graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
-            model_kwargs = self._init_model_kwargs(num_input_tokens)
+            model_kwargs = self._init_model_kwargs()
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
         else:
@@ -1821,6 +1868,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             model_kwargs,
         )
 
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -1873,6 +1922,2050 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
         return sampler_output
+
+    def _bookkeeping_sync(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[
+        dict[str, int],
+        LogprobsLists | None,
+        list[list[int]],
+        dict[str, LogprobsTensors | None],
+        list[str],
+        dict[str, int],
+        list[int],
+    ]:
+        num_nans_in_logits = {}
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
+
+        num_reqs = self.input_batch.num_reqs
+        discard_sampled_tokens_req_indices = np.nonzero(
+            self.discard_request_mask.np[:num_reqs]
+        )[0]
+        for i in discard_sampled_tokens_req_indices:
+            gen = self.input_batch.generators.get(int(i))
+            if gen is not None:
+                gen.set_offset(gen.get_offset() - 4)
+
+        # Copy some objects so they don't get modified after returning.
+        # This is important when using async scheduling.
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+        sampled_token_ids = sampler_output.sampled_token_ids
+        logprobs_tensors = sampler_output.logprobs_tensors
+        invalid_req_indices = []
+        logprobs_lists = None
+        if not self.use_async_scheduling:
+            # Get the valid generated tokens.
+            max_gen_len = sampled_token_ids.shape[-1]
+            if max_gen_len == 1:
+                # No spec decode tokens.
+                valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                # Mask out the sampled tokens that should not be sampled.
+                for i in discard_sampled_tokens_req_indices:
+                    valid_sampled_token_ids[int(i)].clear()
+
+                if logprobs_tensors is not None:
+                    logprobs_lists = logprobs_tensors.tolists()
+            else:
+                # Includes spec decode tokens.
+                valid_sampled_token_ids, logprobs_lists = (
+                    RBLNRejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                        logprobs_tensors=logprobs_tensors,
+                    )
+                )
+        else:
+            valid_sampled_token_ids = []
+            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+            invalid_req_indices_set = set(invalid_req_indices)
+
+            # Cache the sampled tokens on the GPU and avoid CPU sync.
+            # These will be copied into input_ids in the next step
+            # when preparing inputs.
+            # With spec decoding, this is done in propose_draft_token_ids().
+            if self.input_batch.prev_sampled_token_ids is None:
+                assert sampled_token_ids.shape[-1] == 1
+                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            self.input_batch.prev_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids)
+                if i not in invalid_req_indices_set
+            }
+
+        # Cache the sampled tokens in the model runner, so that the scheduler
+        # doesn't need to send them back.
+        # NOTE(woosuk): As an exception, when using PP, the scheduler sends
+        # the sampled tokens back, because there's no direct communication
+        # between the first-stage worker and the last-stage worker.
+        req_ids = self.input_batch.req_ids
+        for req_idx in range(num_sampled_tokens):
+            if self.use_async_scheduling:
+                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+            else:
+                sampled_ids = valid_sampled_token_ids[req_idx]
+
+            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
+
+            if not sampled_ids:
+                continue
+
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + num_sampled_ids
+            assert end_idx <= self.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: "
+                f"{self.max_model_len}"
+            )
+
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+
+            req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.extend(sampled_ids)
+
+        # Compute prompt logprobs if needed.
+        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
+
+        return (
+            num_nans_in_logits,
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        )
+
+    def _get_slot_mappings(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+        ubatch_slices: "UBatchSlices | None" = None,
+    ) -> tuple[
+        dict[int, torch.Tensor] | None,
+        dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ]:
+        """
+        Build slot mappings in both formats needed by the system.
+
+        Args:
+            num_tokens_padded: Total number of tokens (padded)
+            num_reqs_padded: Total number of requests (padded)
+            num_tokens_unpadded: Actual number of tokens (unpadded)
+            ubatch_slices: Optional ubatch slicing info for DBO
+
+        Returns:
+            A tuple of:
+            - slot_mappings_by_gid: dict[int, torch.Tensor] for attention metadata
+            - slot_mappings_by_layer: dict[str, torch.Tensor] or list for ForwardContext
+        """
+        if not (
+            hasattr(self, "kv_cache_config")
+            and self.kv_cache_config is not None
+            and len(self.kv_cache_config.kv_cache_groups) > 0
+        ):
+            return None, None
+
+        def _get_slot_mapping(kv_cache_gid: int):
+            assert num_reqs_padded is not None and num_tokens_padded is not None
+            kv_cache_spec = self.kv_cache_config.kv_cache_groups[
+                kv_cache_gid
+            ].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                slot_mapping = torch.zeros(
+                    (num_tokens_padded,),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                blk_table = self.input_batch.block_table[kv_cache_gid]
+                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+
+            # Fill unused with -1. Needed for reshape_and_cache in full cuda
+            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+
+            return slot_mapping
+
+        slot_mappings_by_gid = {
+            gid: _get_slot_mapping(gid)
+            for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
+        }
+
+        slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+        for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            slot_mapping = slot_mappings_by_gid[gid]
+            for layer_name in kv_cache_group.layer_names:
+                slot_mappings_by_layer[layer_name] = slot_mapping
+
+        if ubatch_slices is not None:
+            result: list[dict[str, torch.Tensor]] = []
+            for ubatch in ubatch_slices:
+                sliced_mappings: dict[str, torch.Tensor] = {}
+                for layer_name, slot_mapping in slot_mappings_by_layer.items():
+                    sliced_mappings[layer_name] = slot_mapping[ubatch.token_slice]
+                result.append(sliced_mappings)
+            return slot_mappings_by_gid, result
+
+        return slot_mappings_by_gid, slot_mappings_by_layer
+
+    @staticmethod
+    def maybe_get_kv_connector_output(
+        scheduler_output: "SchedulerOutput",
+        defer_finalize: bool = False,
+    ) -> AbstractContextManager[KVConnectorOutput | None]:
+        warm_up_phase = scheduler_output.kv_connector_metadata is None
+        return (
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, defer_finalize=defer_finalize
+            )
+            if has_kv_transfer_group() and not warm_up_phase
+            else nullcontext()
+        )
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
+    # TODO(RBLN): Is there any case where `num_padded_tokens` is passed as non-None?
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+        num_padded_tokens: int | None = None,
+    ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
+        self.e2e_start_time = time.perf_counter()
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called "
+                "after execute_model() returns None."
+            )
+
+        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.preempted_req_ids
+            )
+
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        with record_function_or_nullcontext("Preprocess"):
+            self._update_states(scheduler_output)
+
+            # Process sub-block KV cache copy operations before the forward
+            # pass so that partially cached blocks are populated.
+            if (
+                isinstance(scheduler_output, RBLNSchedulerOutput)
+                and scheduler_output.kv_cache_copy_ops
+            ):
+                self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+
+            if not num_scheduled_tokens:
+                warm_up_phase = scheduler_output.kv_connector_metadata is None
+                if not has_kv_transfer_group() or warm_up_phase:
+                    # Return empty ModelRunnerOutput if there's no work to do.
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            if self.cache_config.kv_sharing_fast_prefill:
+                assert not self.num_prompt_logprobs, (
+                    "--kv-sharing-fast-prefill produces incorrect logprobs for "
+                    "prompt tokens, tokens, please disable it when the requests"
+                    " need prompt logprobs"
+                )
+
+            num_reqs = self.input_batch.num_reqs
+            req_ids = self.input_batch.req_ids
+            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+            # max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            # Prepare the decoder inputs.
+            (
+                attn_metadata,
+                logits_indices,
+                spec_decode_metadata,
+                num_scheduled_tokens_np,
+                spec_decode_common_attn_metadata,
+                max_query_len,
+                batch_bucket_size,
+                num_padded_tokens,
+                num_tokens_across_dp,
+            ) = self._prepare_inputs(
+                scheduler_output, num_scheduled_tokens_np, num_padded_tokens
+            )
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_unpadded,
+                num_reqs_padded=num_reqs,
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=None,
+            )
+
+            (
+                num_input_tokens,
+                input_ids,
+                inputs_embeds,
+                positions,
+                model_kwargs,
+            ) = self._preprocess(scheduler_output)
+
+        assert input_ids is not None
+        is_prefill_phase = self.is_prefill_phase()
+
+        # Padding length for speculative decoding by num_speculative_tokens
+        if scheduler_output.scheduled_spec_decode_tokens:
+            max_spec_decode_len = (
+                max(
+                    len(s)
+                    for s in scheduler_output.scheduled_spec_decode_tokens.values()
+                )
+                + 1
+            )
+            num_scheduled_tokens_per_req = torch.tensor(
+                [
+                    scheduler_output.num_scheduled_tokens[i]
+                    for i in self.input_batch.req_ids
+                ],
+                device=input_ids.device,
+                dtype=torch.int32,
+            )
+            input_ids = rbln_utils.pad_speculative_draft_tokens(
+                input_ids,
+                num_scheduled_tokens_per_req,
+                max_spec_decode_len,
+            )
+            positions = rbln_utils.pad_speculative_draft_tokens(
+                positions,
+                num_scheduled_tokens_per_req,
+                max_spec_decode_len,
+            )
+            # `logits_indices` are built for the original flattened
+            # [req0_tokens, req1_tokens, ...] layout. After per-request padding,
+            # flatten order changes to fixed-stride rows
+            # [req0(max_spec), req1(max_spec), ...], so remap indices.
+            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req.to(torch.int64)
+            req_indices = torch.repeat_interleave(
+                torch.arange(num_reqs, device=logits_indices.device),
+                num_scheduled_tokens_i64,
+            )
+            token_offsets = (
+                torch.arange(num_input_tokens, device=logits_indices.device)
+                - num_scheduled_tokens_i64.cumsum(0)[req_indices]
+                + num_scheduled_tokens_i64[req_indices]
+            )
+            unpadded_to_padded = req_indices * max_spec_decode_len + token_offsets
+            logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
+
+        # Run the model.
+        # Use persistent buffers for CUDA graphs.
+        # When spec decode is enabled, defer connector finalization
+        # (wait_for_save + clear metadata) until after draft model runs.
+        defer_kv_connector_finalize = self.speculative_config is not None
+        with (
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
+            ),
+            record_function_or_nullcontext("Forward"),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=defer_kv_connector_finalize,
+            ) as kv_connector_output,
+        ):
+            self._attach_kv_cache_bindings(attn_metadata)
+
+            # FIXME(jiwoo.park) This is a temporary workaround;
+            # we must resolve the batch dimension.
+            input_ids = input_ids.view(num_reqs, -1).to(torch.long)
+            positions = positions.view(num_reqs, -1)
+
+            token_indices = None
+            if is_prefill_phase and not self.use_eagle():
+                # DO NOT include compute logits if lora_config is enabled
+                token_indices = logits_indices
+
+            if is_prefill_phase:
+                # prefill chunk padding
+                prefill_size = self.scheduler_config.max_num_batched_tokens
+                input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
+                positions = rbln_utils.pad(positions, -1, prefill_size)
+            else:
+                # decode batch padding
+                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
+                positions = rbln_utils.pad(positions, -2, batch_bucket_size)
+
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+
+            if self.lora_config is not None:
+                lora_ids = [
+                    self.requests[req_id].lora_request.lora_int_id
+                    if self.requests[req_id].lora_request is not None
+                    else 0
+                    for req_id in self.input_batch.req_ids
+                ]
+
+                lora_mask = create_lora_mask(
+                    input_ids,
+                    lora_ids,
+                    self.lora_manager._adapter_manager.lora_index_to_id,
+                    self.lora_config.max_loras,
+                    self.lora_config.max_lora_rank,
+                    self.lora_config.lora_dtype,
+                    self.device,
+                )
+                sampler_indices_padded = create_sampler_indices_padded(
+                    lora_ids,
+                    self.lora_manager._adapter_manager.lora_index_to_id,
+                    batch_bucket_size,
+                    is_prefill_phase,
+                    self.lora_config.max_loras,
+                    self.device,
+                )
+                LoRAMask.set_lora_mask(lora_mask)
+                LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
+
+            model_start_time = time.perf_counter()
+            with capture_ctx as reports:
+                model_output = self.model_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    selected_token_indices=token_indices,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            if self.performance_tracker is not None:
+                # Record performance metrics
+                model_end_time = time.perf_counter()
+                model_execution_time = model_end_time - model_start_time
+                host_time = None
+                device_time = None
+                ccl_time = None
+
+                if reports is not None and len(reports) > 0:
+                    host_time = reports[0].get("total_host", None)
+                    device_time = reports[0].get("total_device", None)
+                    ccl_time = reports[0].get("total_ccl", None)
+
+                if is_prefill_phase:
+                    self.performance_tracker.record_prefill(
+                        model_execution_time,
+                        num_scheduled_tokens,
+                        host_time=host_time,
+                        device_time=device_time,
+                        ccl_time=ccl_time,
+                        request_ids=self.input_batch.req_ids,
+                    )
+                else:
+                    padded_decode = (
+                        num_padded_tokens is not None
+                        and num_padded_tokens != batch_bucket_size
+                    )
+                    self.performance_tracker.record_decode(
+                        model_execution_time,
+                        num_scheduled_tokens,
+                        host_time=host_time,
+                        device_time=device_time,
+                        ccl_time=ccl_time,
+                        padded_decode=padded_decode,
+                        request_ids=self.input_batch.req_ids,
+                    )
+
+        with record_function_or_nullcontext("Postprocess"):
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states, logits = model_output  # type: ignore[misc]
+            else:
+                hidden_states, logits = model_output  # type: ignore[misc]
+                aux_hidden_states = None
+            sample_hidden_states = None
+
+            # Broadcast PP output for external_launcher (torchrun)
+            # to make sure we are synced across pp ranks
+            # TODO: Support overlapping mirco-batches
+            # https://github.com/vllm-project/vllm/issues/18019
+            broadcast_pp_output = (
+                self.parallel_config.distributed_executor_backend == "external_launcher"
+                and len(get_pp_group().ranks) > 0
+            )
+            if not get_pp_group().is_last_rank:
+                # For mid-pipeline stages, return intermediate tensors
+                assert isinstance(hidden_states, IntermediateTensors)
+                if not broadcast_pp_output:
+                    hidden_states.kv_connector_output = kv_connector_output
+                    self.kv_connector_output = kv_connector_output
+                    return hidden_states
+                # NOTE - DO NOT all_gather_group for RBLN pp
+                get_pp_group().send_tensor_dict(hidden_states.tensors)
+                logits = None
+            else:
+                # for last-pipeline stages, return hidden states
+                if self.is_pooling_model:
+                    return self._pool(
+                        hidden_states.flatten(0, -2),
+                        num_scheduled_tokens,
+                        num_scheduled_tokens_np,
+                        kv_connector_output,
+                    )
+                sample_hidden_states = hidden_states
+                if not self.use_wrapped_compute_logits():
+                    # DO NOT include compute logits
+
+                    # FIXME(jiwoo.park) This is a temporary workaround;
+                    # SHOULD resolve the batch dimension.
+                    hidden_states = hidden_states.flatten(0, -2)
+
+                    if is_prefill_phase:  # prefill
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.compute_logits(sample_hidden_states)
+                    else:  # decode
+                        logits = self.compute_logits(hidden_states)
+                        logits = logits[logits_indices]
+                    if not envs.VLLM_RBLN_LOGITS_ALL_GATHER:
+                        logits = self.logits_processor._gather_logits(logits)
+                    logits = logits.view(-1, logits.size(-1))
+                else:
+                    selected_token_indices = logits_indices
+                    assert selected_token_indices.dim() == 1
+                    if is_prefill_phase:  # prefill
+                        assert selected_token_indices.size(0) == 1
+                        num_computed = self.input_batch.num_computed_tokens_cpu
+                        num_prompted = self.input_batch.num_prompt_tokens
+                        is_last_prefill = (
+                            num_computed + self.max_num_tokens
+                        ) >= num_prompted
+                        if not is_last_prefill[0]:  # noqa: SIM108
+                            # chunked prefill(#0~#N-1, intermediate)
+                            # token_indices = torch.tensor([max_num_seqs-1])
+                            # selected = torch.tensor([])
+                            logits = logits[:0]
+                        else:
+                            # chunked prefill(#N, final)
+                            # token_indices = torch.tensor([last_seq_idx-1])
+                            # selected_token_indices == token_indices
+                            logits = logits
+
+                        if self.use_eagle():
+                            hidden_states = hidden_states.flatten(0, -2)
+                            sample_hidden_states = hidden_states[logits_indices]
+                            logits = logits[logits_indices]
+                    else:  # decode
+                        # selected_token_indices is for valid decode tokens
+                        # token_indices == None, selected = torch.tensor([0])
+                        if self.speculative_config is None:
+                            logits = logits[:num_input_tokens]
+                        else:
+                            batch_indices = torch.arange(
+                                self.input_batch.num_reqs, device=self.device
+                            )
+                            sample_hidden_states = hidden_states[
+                                batch_indices,
+                                : self.speculative_config.num_speculative_tokens + 1,
+                            ]
+                            logits = logits[selected_token_indices]
+
+            if broadcast_pp_output:
+                model_output_broadcast_data = (
+                    {
+                        "logits": logits.contiguous(),
+                    }
+                    if logits is not None
+                    else {}
+                )
+                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
+                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                )
+                assert model_output_broadcast_data is not None
+                logits = model_output_broadcast_data["logits"]
+
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output,
+            logits,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            slot_mappings,
+        )
+        self.kv_connector_output = kv_connector_output
+        return None
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
+    @torch.inference_mode()
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if self.execute_model_state is None:
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            # receive sampled token ids from the last PP rank.
+            if self.use_async_scheduling and get_pp_group().world_size > 1:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+            if not kv_connector_output:
+                return None  # type: ignore[return-value]
+
+            # In case of PP with kv transfer, we need to pass through the
+            # kv_connector_output
+            if kv_connector_output.is_empty():
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+            output.kv_connector_output = kv_connector_output
+            return output
+
+        # Unpack ephemeral state.
+        (
+            scheduler_output,
+            logits,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            slot_mappings,
+        ) = self.execute_model_state
+        # Clear ephemeral state.
+        self.execute_model_state = None
+
+        # Apply structured output bitmasks if present.
+        if grammar_output is not None and logits.shape[0] > 0:
+            # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
+            # to be float32 dtype for CPU tensors
+            original_dtype = logits.dtype
+            logits = logits.to(torch.float32)
+            apply_grammar_bitmask(
+                scheduler_output, grammar_output, self.input_batch, logits
+            )
+            logits = logits.to(original_dtype)
+
+        with record_function_or_nullcontext("Sample"):
+            sampler_output = self._sample(logits, spec_decode_metadata)
+
+        def propose_draft_token_ids(sampled_token_ids):
+            assert spec_decode_common_attn_metadata is not None
+            with record_function_or_nullcontext("Draft"):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    scheduler_output,
+                    sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    hidden_states,
+                    sample_hidden_states,
+                    aux_hidden_states,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    slot_mappings,
+                )
+
+        spec_config = self.speculative_config
+        use_padded_batch_for_eagle = (
+            self.use_eagle() and not spec_config.disable_padded_drafter_batch
+        )
+        effective_drafter_max_model_len = self.max_model_len
+        if effective_drafter_max_model_len is None:
+            effective_drafter_max_model_len = self.model_config.max_model_len
+        if (
+            spec_config is not None
+            and spec_config.draft_model_config is not None
+            and spec_config.draft_model_config.max_model_len is not None
+        ):
+            effective_drafter_max_model_len = (
+                spec_config.draft_model_config.max_model_len
+            )
+        input_fits_in_drafter = spec_decode_common_attn_metadata and (
+            spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+            <= effective_drafter_max_model_len
+        )
+        if use_padded_batch_for_eagle:
+            assert spec_config is not None
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            sampled_token_ids = sampler_output.sampled_token_ids
+            if input_fits_in_drafter:
+                # EAGLE speculative decoding can use the GPU sampled tokens as
+                # inputs, and does not need to wait for bookkeeping to finish.
+                propose_draft_token_ids(sampled_token_ids)
+
+        with record_function_or_nullcontext("Bookkeep"):
+            # NOTE:
+            # is_prefill is changed after bookkeeping
+            # so we need to get it before bookkeeping,
+            # and pass it to performance tracker.
+            is_prefill_phase = self.is_prefill_phase()
+            (
+                num_nans_in_logits,
+                logprobs_lists,
+                valid_sampled_token_ids,
+                prompt_logprobs_dict,
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
+                invalid_req_indices,
+            ) = self._bookkeeping_sync(
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+                spec_decode_metadata,
+            )
+
+        if (
+            self.speculative_config
+            and not use_padded_batch_for_eagle
+            and input_fits_in_drafter
+        ):
+            # ngram and other speculative decoding methods use the sampled
+            # tokens on the CPU, so they are run after bookkeeping.
+            propose_draft_token_ids(valid_sampled_token_ids)
+
+        # Finalize KV connector (wait_for_save + clear metadata) after
+        # draft model runs. Deferred from target model forward to allow
+        # draft model to also save its KV cache.
+        if spec_config is not None:
+            self.finalize_kv_connector()
+
+        # FIXME(jiwoo.park) EPLB is not supported in RBLN
+        # with record_function_or_nullcontext("EPLB"):
+        #     self.eplb_step()
+
+        # self.kv_connector_output may be modified during drafting
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
+
+        output = ModelRunnerOutput(
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+            num_nans_in_logits=num_nans_in_logits,
+        )
+
+        if self.e2e_performance_tracker is not None:
+            self.e2e_end_time = time.perf_counter()
+            collect_metrics(
+                self.e2e_performance_tracker,
+                is_prefill_phase,
+                start_time=self.e2e_start_time,
+                end_time=self.e2e_end_time,
+                reports=[],
+                token_count=scheduler_output.total_num_scheduled_tokens,
+            )
+
+        if not self.use_async_scheduling:
+            return output
+
+        return AsyncRBLNModelRunnerOutput(
+            model_runner_output=output,
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            invalid_req_indices=invalid_req_indices,
+            async_output_copy_stream=self.async_output_copy_stream,
+        )
+
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self._draft_token_ids is None:
+            return None
+        req_ids = self.input_batch.req_ids
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            draft_token_ids = self._draft_token_ids.tolist()
+        else:
+            draft_token_ids = self._draft_token_ids
+        self._draft_token_ids = None
+        return DraftTokenIds(req_ids, draft_token_ids)
+
+    # TODO(RBLN): Forked from upstream but this method is disabled for now.
+    def _copy_valid_sampled_token_count(
+        self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
+    ) -> None:
+        if self.valid_sampled_token_count_event is None:
+            return
+
+        default_stream = torch.cuda.current_stream()
+        # Initialize a new stream to overlap the copy operation with
+        # prepare_input of draft model.
+        with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
+            counts = valid_sampled_tokens_count
+            counts_cpu = self.valid_sampled_token_count_cpu
+            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
+            self.valid_sampled_token_count_event.record()
+
+        self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+
+    def _get_valid_sampled_token_count(self) -> list[int]:
+        # Wait until valid_sampled_tokens_count is copied to cpu,
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        sampled_count_event = self.valid_sampled_token_count_event
+        if sampled_count_event is None or prev_sampled_token_ids is None:
+            return []
+
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        sampled_count_event.synchronize()
+        return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
+    def propose_draft_token_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ) -> list[list[int]] | torch.Tensor:
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        spec_config = self.speculative_config
+        assert spec_config is not None
+        if spec_config.method == "ngram":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, NgramProposer)
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids,
+                self.input_batch.num_tokens_no_spec,
+                self.input_batch.token_ids_cpu,
+                slot_mappings=slot_mappings,
+            )
+        elif spec_config.method == "suffix":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, SuffixDecodingProposer)
+            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
+        elif spec_config.method == "medusa":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, RBLNMedusaProposer)
+
+            if spec_decode_metadata is None:
+                # prefill: hidden states are already per-request
+                hidden_states = sample_hidden_states
+            else:
+                # decode with draft tokens:
+                # pick last accepted token's hidden state per request
+                batch_indices = torch.arange(
+                    sample_hidden_states.shape[0], device=sample_hidden_states.device
+                )
+                indices = torch.tensor(
+                    [len(t) - 1 for t in sampled_token_ids],
+                    device=sample_hidden_states.device,
+                    dtype=torch.long,
+                )
+                hidden_states = sample_hidden_states[batch_indices, indices]
+
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+            draft_token_ids = self.drafter.propose(
+                target_hidden_states=hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+        elif spec_config.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            assert spec_config.disable_padded_drafter_batch is not True, (
+                "This option is not supported in vllm-rbln."
+            )
+            assert isinstance(sampled_token_ids, torch.Tensor), (
+                "sampled_token_ids should be a torch.Tensor."
+            )
+
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    common_attn_metadata,
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+
+            target_hidden_states = hidden_states
+            num_rejected_tokens_gpu = None
+            if spec_decode_metadata is None:
+                token_indices_to_sample = None
+                # input_ids can be None for multimodal models.
+                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
+                target_positions = self._get_positions(num_scheduled_tokens)
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                    )
+            else:
+                (
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_rejected_tokens_gpu,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
+                )
+                total_num_tokens = common_attn_metadata.num_actual_tokens
+                # When padding the batch, token_indices is just a range
+                target_token_ids = self.input_ids.gpu[:total_num_tokens]
+                target_positions = self._get_positions(total_num_tokens)
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                    )
+
+            if self.supports_mm_inputs:
+                mm_embed_inputs = self._gather_mm_embeddings(
+                    scheduler_output,
+                    shift_computed_tokens=1,
+                )
+            else:
+                mm_embed_inputs = None
+
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                sampling_metadata=sampling_metadata,
+                common_attn_metadata=common_attn_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+
+        return draft_token_ids
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Document and sync with the current upstream version.
+    def load_model(self) -> None:
+        logger.info("Starting to load model %s...", self.model_config.model)
+        model_loader = get_model_loader(self.load_config)
+        if not hasattr(self, "model"):
+            logger.info("Loading model from scratch...")
+            self.model = model_loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
+        else:
+            logger.info("Model was already initialized. Loading weights inplace...")
+            model_loader.load_weights(self.model, model_config=self.model_config)
+
+        self.model = self.get_model().eval()
+        self.compute_logits_model = self.model
+        if self.model_config.is_multimodal_model and hasattr(
+            self.model.get_language_model(), "logits_processor"
+        ):
+            self.compute_logits_model = self.model.get_language_model()
+            self.logits_processor = self.model.get_language_model().logits_processor
+        elif hasattr(self.model, "logits_processor"):
+            self.logits_processor = self.model.logits_processor
+        else:
+            self.logits_processor = None
+
+        logger.info("load_model = %s", self.model)
+        logger.info(
+            "model_config.num_layers = %d",
+            self.model_config.get_num_layers(self.parallel_config),
+        )
+
+        def model_wrapper(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            intermediate_tensors: IntermediateTensors | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            selected_token_indices: torch.Tensor | None = None,
+        ) -> (
+            tuple[Any, Any, Any]
+            | tuple[Any, Any]
+            | tuple[
+                Union[torch.Tensor, IntermediateTensors],
+                torch.Tensor | Any,
+                Any,
+                Any | None,
+            ]
+        ):
+            """
+            This wrapper function is designed to be compiled by torch.compile.
+            It handles the forward pass of the underlying model and, computes
+            the logits from the hidden states if necessary.
+            """
+            model_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
+
+            logits = None
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
+
+            if (
+                get_pp_group().is_last_rank
+                and self.use_wrapped_compute_logits()
+                and not self.is_pooling_model
+                and self.logits_processor is not None
+            ):
+                # last rank create real model output
+                if selected_token_indices is not None:
+                    # aten::select -> adv_index -->
+                    #     contrib_dynamic_take (tensor -> scalar)
+                    # aten::index_select --> take -->
+                    #     contrib_dynamic_take (tensor -> scalar)
+                    hidden_states = hidden_states[:, selected_token_indices]
+                logits = self.compute_logits_model.compute_logits(hidden_states)
+                logits = logits.view(-1, logits.size(-1))
+
+            # non last rank create intermediate tensors, bypass it
+            if self.use_aux_hidden_state_outputs:
+                return hidden_states, aux_hidden_states, logits
+            return hidden_states, logits
+
+        if self.lora_config:
+            self.model = self.load_lora_model(
+                self.model,
+                self.vllm_config,
+                self.device,
+            )
+        if hasattr(self, "drafter"):
+            logger.info("Loading drafter model...")
+            self.drafter.load_model(self.model)
+        if self.use_aux_hidden_state_outputs:
+            if not supports_eagle3(self.get_model()):
+                raise RuntimeError(
+                    "Model does not support EAGLE3 interface but "
+                    "aux_hidden_state_outputs was requested"
+                )
+
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if aux_layers:
+                logger.info(
+                    "Using auxiliary layers from speculative config: %s",
+                    aux_layers,
+                )
+            else:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+
+            self.model.set_aux_hidden_state_layers(aux_layers)
+
+        # FIXME - device specific communication buffer (CUDA)?
+        # disable communication buffer for RBLN (NYI)
+        # communication buffers for efficient communication
+        # TODO - RBLN communication buffer can be defined
+        # prepare_communication_buffer_for_model(self.model)
+
+        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+            self.model_executable = model_wrapper
+        else:
+            # NOTE - refer to pytorch 2.5 release notes
+            # torch.compile regional compilation without recompilations
+            # To prevent nn.modules parameters to be model input, set false
+            # if this flag is set, nn.modules parameters are treated
+            # as model input
+            torch._dynamo.config.inline_inbuilt_nn_modules = False
+            torch._dynamo.config.cache_size_limit = 64
+            # RBLN compile context to mark static address for kv cache tensor
+            # if tensor is set to have static address,
+            # similar to RBLN kv cache binding
+
+            compiled_graph = self._compile_model(model_wrapper)
+            self.model_executable = compiled_graph
+
+        distributed_executor_backend = (
+            self.vllm_config.parallel_config.distributed_executor_backend
+        )
+        if distributed_executor_backend == "ray":
+            self._prepare_prefill_intermediate_tensors()
+            for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
+                self._prepare_decode_intermediate_tensors(batch_bucket_size)
+        else:
+            with torch.inference_mode():
+                self._prepare_prefill_intermediate_tensors()
+                for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
+                    self._prepare_decode_intermediate_tensors(batch_bucket_size)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        """Extract Eagle3 auxiliary layer indices from speculative config.
+
+        These indices specify which hidden states from the base model should
+        be used as auxiliary inputs for the Eagle3 drafter model during
+        speculative decoding.
+
+        Returns:
+            Tuple of layer indices if found in draft model config,
+            None otherwise.
+        """
+        if not (self.speculative_config and self.speculative_config.draft_model_config):
+            return None
+
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
+
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(layer_ids)
+
+        return None
+
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version.
+    def _get_prompt_logprobs_dict(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, LogprobsTensors | None]:
+        num_prompt_logprobs_dict = self.num_prompt_logprobs
+        if not num_prompt_logprobs_dict:
+            return {}
+
+        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
+
+        # Since prompt logprobs are a rare feature, prioritize simple,
+        # maintainable loop over optimal performance.
+        completed_prefill_reqs = []
+        for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
+            num_tokens = num_scheduled_tokens.get(req_id)
+            if num_tokens is None:
+                # This can happen if the request was preempted in prefill stage.
+                continue
+
+            # Get metadata for this request.
+            request = self.requests[req_id]
+            num_prompt_tokens = len(request.prompt_token_ids)
+            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
+                self.device, non_blocking=True
+            )
+
+            # Set up target LogprobsTensors object.
+            logprobs_tensors = in_progress_dict.get(req_id)
+            if not logprobs_tensors:
+                # Create empty logprobs CPU tensors for the entire prompt.
+                # If chunked, we'll copy in slice by slice.
+                logprobs_tensors = LogprobsTensors.empty_cpu(
+                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                )
+                in_progress_dict[req_id] = logprobs_tensors
+
+            # Determine number of logits to retrieve.
+            start_idx = request.num_computed_tokens
+            start_tok = start_idx + 1
+            num_remaining_tokens = num_prompt_tokens - start_tok
+            if num_tokens <= num_remaining_tokens:
+                # This is a chunk, more tokens remain.
+                # In the == case, there are no more prompt logprobs to produce
+                # but we want to defer returning them to the next step where we
+                # have new generated tokens to return.
+                num_logits = num_tokens
+            else:
+                # This is the last chunk of prompt tokens to return.
+                num_logits = num_remaining_tokens
+                completed_prefill_reqs.append(req_id)
+                prompt_logprobs_dict[req_id] = logprobs_tensors
+
+            if num_logits <= 0:
+                # This can happen for the final chunk if we prefilled exactly
+                # (num_prompt_tokens - 1) tokens for this request in the prior
+                # step. There are no more prompt logprobs to produce.
+                continue
+
+            # Get the logits corresponding to this req's prompt tokens.
+            # If this is a partial request (i.e. chunked prefill),
+            # then there is prompt logprob generated for each index.
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            offset = self.query_start_loc.np[req_idx].item()
+            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            logits = self.model.compute_logits(prompt_hidden_states)
+
+            # Get the "target" tokens for each index. For prompt at index i,
+            # the token at prompt index i+1 is the "sampled" token we want
+            # to gather the logprob for.
+            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+
+            # Compute prompt logprobs.
+            logprobs = self.sampler.compute_logprobs(logits)
+            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
+                logprobs, num_prompt_logprobs, tgt_token_ids
+            )
+
+            # Transfer GPU->CPU async.
+            chunk_slice = slice(start_idx, start_idx + num_logits)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                token_ids, non_blocking=True
+            )
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                ranks, non_blocking=True
+            )
+
+        # Remove requests that have completed prefill from the batch
+        # num_prompt_logprobs_dict.
+        for req_id in completed_prefill_reqs:
+            del num_prompt_logprobs_dict[req_id]
+            del in_progress_dict[req_id]
+
+        # Must synchronize the non-blocking GPU->CPU transfers.
+        if prompt_logprobs_dict:
+            self._sync_device()
+
+        return prompt_logprobs_dict
+
+    def _get_nans_in_logits(
+        self,
+        logits: torch.Tensor | None,
+    ) -> dict[str, int]:
+        try:
+            if logits is None:
+                return {req_id: 0 for req_id in self.input_batch.req_ids}
+
+            num_nans_in_logits = {}
+            num_nans_for_index = logits.isnan().sum(dim=-1).cpu().numpy()
+            for req_id in self.input_batch.req_ids:
+                req_index = self.input_batch.req_id_to_index[req_id]
+                num_nans_in_logits[req_id] = (
+                    int(num_nans_for_index[req_index])
+                    if num_nans_for_index is not None and req_index < logits.shape[0]
+                    else 0
+                )
+            return num_nans_in_logits
+        except IndexError:
+            return {}
+
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version.
+    @contextmanager
+    def maybe_randomize_inputs(self, input_ids: torch.Tensor):
+        """
+        Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
+        This is to help balance expert-selection
+         - during profile_run
+         - during DP rank dummy run
+        """
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        if not randomize_inputs:
+            yield
+        else:
+            import functools
+
+            @functools.cache
+            def rand_input_ids() -> torch.Tensor:
+                return torch.randint_like(
+                    self.input_ids.gpu,
+                    low=0,
+                    high=self.model_config.get_vocab_size(),
+                    dtype=input_ids.dtype,
+                )
+
+            logger.debug_once("Randomizing dummy input_ids for DP Rank")
+            input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
+            yield
+            input_ids.fill_(0)
+
+    def _get_mm_dummy_batch(
+        self,
+        modality: str,
+        max_items_per_batch: int,
+    ) -> BatchedTensorInputs:
+        """Dummy data for profiling and precompiling multimodal models."""
+        assert self.mm_budget is not None
+
+        # Don't use `max_items_per_batch` here to avoid redundant computation
+        dummy_mm_inputs = self.mm_registry.get_dummy_mm_inputs(
+            self.model_config,
+            mm_counts={modality: 1},
+            cache=self.mm_budget.cache,
+        )
+        dummy_mm_item = dummy_mm_inputs["mm_kwargs"][modality][0]
+
+        # We use the cache so that the item is saved to the cache,
+        # but not read from the cache
+        assert dummy_mm_item is not None, "Item should not already be cached"
+
+        return next(
+            mm_kwargs_batch
+            for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
+                [(modality, dummy_mm_item)] * max_items_per_batch,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+        )
+
+    # TODO(RBLN): def _dummy_run(...)
+    # TODO(RBLN): def _dummy_sampler_run(...)
+
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version.
+    def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
+        """
+        Initialize the attention backends and attention metadata builders.
+        """
+        assert len(self.attn_groups) == 0, "Attention backends are already initialized"
+
+        class AttentionGroupKey(NamedTuple):
+            attn_backend: type[AttentionBackend]
+            kv_cache_spec: KVCacheSpec
+
+        def get_attn_backends_for_group(
+            kv_cache_group_spec: KVCacheGroupSpec,
+        ) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:
+            layer_type = cast(type[Any], AttentionLayerBase)
+            layers = get_layers_from_vllm_config(
+                self.vllm_config, layer_type, kv_cache_group_spec.layer_names
+            )
+            attn_backends = {}
+            attn_backend_layers = defaultdict(list)
+            # Dedupe based on full class name; this is a bit safer than
+            # using the class itself as the key because when we create dynamic
+            # attention backend subclasses (e.g. ChunkedLocalAttention) unless
+            # they are cached correctly, there will be different objects per
+            # layer.
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_backend = layers[layer_name].get_attn_backend()
+
+                if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
+                    attn_backend = create_fast_prefill_custom_backend(
+                        "FastPrefill",
+                        attn_backend,  # type: ignore[arg-type]
+                    )
+
+                full_cls_name = attn_backend.full_cls_name()
+                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                key = (full_cls_name, layer_kv_cache_spec)
+                attn_backends[key] = AttentionGroupKey(
+                    attn_backend, layer_kv_cache_spec
+                )
+                attn_backend_layers[key].append(layer_name)
+            return (
+                {attn_backends[k]: v for k, v in attn_backend_layers.items()},
+                set(group_key.attn_backend for group_key in attn_backends.values()),
+            )
+
+        def create_attn_groups(
+            attn_backends_map: dict[AttentionGroupKey, list[str]],
+            kv_cache_group_id: int,
+        ) -> list[AttentionGroup]:
+            attn_groups: list[AttentionGroup] = []
+            for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
+                attn_group = AttentionGroup(
+                    attn_backend,
+                    layer_names,
+                    kv_cache_spec,
+                    kv_cache_group_id,
+                )
+
+                attn_groups.append(attn_group)
+            return attn_groups
+
+        attention_backend_maps = []
+        attention_backend_list = []
+        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+            attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
+            attention_backend_maps.append(attn_backends[0])
+            attention_backend_list.append(attn_backends[1])
+
+        for i, attn_backend_map in enumerate(attention_backend_maps):
+            self.attn_groups.append(create_attn_groups(attn_backend_map, i))
+
+    def initialize_metadata_builders(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> None:
+        """
+        Create the metadata builders for all KV cache groups and attn groups.
+        """
+        for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
+            for attn_group in self.attn_groups[kv_cache_group_id]:
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_sizes[kv_cache_group_id]
+                    if kv_cache_group_id < len(kernel_block_sizes)
+                    else None,
+                    num_metadata_builders=1
+                    if not self.parallel_config.enable_dbo
+                    else 2,
+                )
+        # Calculate reorder batch threshold (if needed)
+        # Note (tdoublep): do this *after* constructing builders,
+        # because some of them change the threshold at init time.
+        self.calculate_reorder_batch_threshold()
+
+        # Initialize drafter attention backend
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+        ):
+            assert isinstance(self.drafter, RBLNEagleProposer)  # | DraftModelProposer)
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+
+    # TODO(RBLN): Forked from upstream but disabled for now.
+    def calculate_reorder_batch_threshold(self) -> None:
+        """
+        Check that if any backends reorder batches; that the reordering
+        is compatible (e.g., decode threshold is the same)
+        """
+
+        # check that if any backends reorder batches; that the reordering
+        # is compatible (e.g., decode threshold is the same)
+        # TODO(RBLN): We need to implement reorder batch threshold
+        pass
+
+    # TODO(RBLN): Forked from upstream,
+    # but not yet synced with the current upstream version.
+    def may_reinitialize_input_batch(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> None:
+        """
+        Re-initialize the input batch if the block sizes are different from
+        `[self.cache_config.block_size]`. This usually happens when there
+        are multiple KV cache groups.
+
+        Args:
+            kv_cache_config: The KV cache configuration.
+            kernel_block_sizes: The kernel block sizes for each KV cache group.
+        """
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
+        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
+            kv_cache_config, max_model_len
+        )
+
+        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
+            self.cache_config.block_size
+        ]:
+            assert self.offload_config.uva.cpu_offload_gb == 0, (
+                "Cannot re-initialize the input batch when CPU weight "
+                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
+                "for more details."
+            )
+            self.input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=block_sizes,
+                kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
+                is_spec_decode=bool(self.vllm_config.speculative_config),
+                logitsprocs=self.input_batch.logitsprocs,
+                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
+                is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            )
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Comment for RBLN-specific parts.
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor]:
+        """
+        Initializes the KV cache buffer with the correct size. The buffer needs
+        to be reshaped to the desired shape before being used by the models.
+
+        Args:
+            kv_cache_config: The KV cache config
+        Returns:
+            dict[str, torch.Tensor]: A map between layer names to their
+            corresponding memory buffer for KV cache.
+        """
+        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else "meta"
+            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_raw_tensors[layer_name] = tensor
+
+        layer_names = set()
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                layer_names.add(layer_name)
+        assert layer_names == set(kv_cache_raw_tensors.keys()), (
+            "Some layers are not correctly initialized"
+        )
+        return kv_cache_raw_tensors
+
+    def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
+        return itertools.chain.from_iterable(self.attn_groups)
+
+    def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
+        if not self.kv_cache_config.kv_cache_groups:
+            return
+        for attn_groups in self.attn_groups:
+            yield from attn_groups
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # NOTE(RBLN): Introduce KVCacheViewInfo at PR#524. (https://github.com/RBLN-SW/vllm-rbln/pull/524)
+    # TODO(RBLN): Comment for RBLN-specific parts.
+    def _reshape_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+        dict[str, KVCacheViewInfo],
+    ]:
+        """
+        Reshape the KV cache tensors to the desired shape and dtype.
+
+        Args:
+            kv_cache_config: The KV cache config
+            kv_cache_raw_tensors: The KV cache buffer of each layer, with
+                correct size but uninitialized shape.
+            kernel_block_sizes: The kernel block sizes for each KV cache group.
+        Returns:
+            Tuple of (kv_caches, kv_cache_base_tensors, kv_cache_view_infos):
+            - kv_caches: layer name -> reshaped+permuted KV cache tensor
+            - kv_cache_base_tensors: layer name -> typed base tensor (pre-permute)
+            - kv_cache_view_infos: layer name -> view transformation metadata
+        """
+        kv_caches: dict[str, torch.Tensor] = {}
+        kv_cache_base_tensors: dict[str, torch.Tensor] = {}
+        kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
+        has_attn, has_mamba = False, False
+        for group in self._kv_cache_spec_attn_group_iterator():
+            kv_cache_spec = group.kv_cache_spec
+            attn_backend = group.backend
+            if group.kv_cache_group_id == len(kernel_block_sizes):
+                # There may be a last group for layers without kv cache.
+                continue
+            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                raw_tensor = kv_cache_raw_tensors[layer_name]
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                if isinstance(kv_cache_spec, AttentionSpec):
+                    has_attn = True
+                    num_blocks_per_kv_block = (
+                        kv_cache_spec.block_size // kernel_block_size
+                    )
+                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+
+                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                        kernel_num_blocks,
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype_str=self.cache_config.cache_dtype,
+                    )
+                    dtype = kv_cache_spec.dtype
+                    try:
+                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                    except (AttributeError, NotImplementedError):
+                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    # The allocation respects the backend-defined stride order
+                    # to ensure the semantic remains consistent for each
+                    # backend. We first obtain the generic kv cache shape and
+                    # then permute it according to the stride order which could
+                    # result in a non-contiguous tensor.
+                    kv_cache_shape = tuple(
+                        kv_cache_shape[i] for i in kv_cache_stride_order
+                    )
+                    # Maintain original KV shape view.
+                    inv_order = [
+                        kv_cache_stride_order.index(i)
+                        for i in range(len(kv_cache_stride_order))
+                    ]
+                    # Keep the deduped base in a backend-native multidimensional
+                    # shape so export/Relay never sees a giant flat dimension.
+                    typed_base = (
+                        kv_cache_raw_tensors[layer_name]
+                        .view(dtype)
+                        .view(kv_cache_shape)
+                    )
+                    kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    kv_cache_base_tensors[layer_name] = typed_base
+                    kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        view_shape=kv_cache_shape,
+                        permute_order=tuple(inv_order),
+                    )
+                elif isinstance(kv_cache_spec, MambaSpec):
+                    has_mamba = True
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    state_tensors = []
+                    storage_offset_bytes = 0
+                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                        dtype_size = get_dtype_size(dtype)
+                        num_element_per_page = (
+                            kv_cache_spec.page_size_bytes // dtype_size
+                        )
+                        target_shape = (num_blocks, *shape)
+                        stride = torch.empty(target_shape).stride()
+                        target_stride = (num_element_per_page, *stride[1:])
+                        assert storage_offset_bytes % dtype_size == 0
+                        tensor = torch.as_strided(
+                            raw_tensor.view(dtype),
+                            size=target_shape,
+                            stride=target_stride,
+                            storage_offset=storage_offset_bytes // dtype_size,
+                        )
+                        state_tensors.append(tensor)
+                        storage_offset_bytes += stride[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                else:
+                    raise NotImplementedError
+
+        if has_attn and has_mamba:
+            self._update_hybrid_attention_mamba_layout(kv_caches)
+
+        return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Comment for RBLN-specific parts.
+    def initialize_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Initialize the memory buffer for KV cache.
+
+        Args:
+            kv_cache_config: The KV cache config
+            kernel_block_sizes: The kernel block sizes for each KV cache group.
+
+        Returns:
+            Dict[str, torch.Tensor]: A map between layer names to their
+            corresponding memory buffer for KV cache.
+        """
+
+        # Try creating KV caches optimized for kv-connector transfers
+        cache_dtype = self.cache_config.cache_dtype
+        kv_cache_bases_by_layer: dict[str, torch.Tensor]
+        kv_cache_view_infos: dict[str, KVCacheViewInfo]
+        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
+            kv_caches, cross_layers_kv_cache, attn_backend = (
+                self.allocate_uniform_kv_caches(
+                    kv_cache_config,
+                    self.attn_groups,
+                    cache_dtype,
+                    self.device,
+                    kernel_block_sizes,
+                )
+            )
+            self.cross_layers_kv_cache = cross_layers_kv_cache
+            self.cross_layers_attn_backend = attn_backend
+            kv_cache_bases_by_layer = {
+                layer_name: cross_layers_kv_cache for layer_name in kv_caches
+            }
+            kv_cache_view_infos = self._build_uniform_kv_cache_view_infos(
+                kv_cache_config,
+                cross_layers_kv_cache,
+                attn_backend,
+            )
+        else:
+            # Fallback to the general case
+            # Initialize the memory buffer for KV cache
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+
+            # Change the memory buffer to the desired shape
+            kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos = (
+                self._reshape_kv_cache_tensors(
+                    kv_cache_config,
+                    kv_cache_raw_tensors,
+                    kernel_block_sizes,
+                )
+            )
+
+        # Set up cross-layer KV cache sharing
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+            logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+            kv_caches[layer_name] = kv_caches[target_layer_name]
+            kv_cache_bases_by_layer[layer_name] = kv_cache_bases_by_layer[
+                target_layer_name
+            ]
+            if target_layer_name in kv_cache_view_infos:
+                kv_cache_view_infos[layer_name] = kv_cache_view_infos[target_layer_name]
+
+        validate_shared_attention_kv_cache_contiguity(
+            kv_caches,
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+        )
+
+        num_attn_module = (
+            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
+        )
+        self.kv_cache_bases = []
+        self.kv_cache_view_infos = []
+        self._update_kv_cache_base_bindings(
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+            num_attn_module,
+        )
+        bind_kv_cache(
+            kv_caches,
+            self.compilation_config.static_forward_context,
+            self.kv_caches,
+            num_attn_module,
+        )
+        if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
+            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
+            assert len(kv_cache_names) == len(self.kv_caches)
+            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
+                self.compile_context.mark_static_address(kv_cache, name)
+
+        return kv_caches
+
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """
+        Add layers that reuse KV cache to KV cache group of its target layer.
+        Mapping of KV cache tensors happens in `initialize_kv_cache_tensors()`
+        """
+        if not self.shared_kv_cache_layers:
+            # No cross-layer KV sharing, return
+            return
+
+        add_kv_sharing_layers_to_kv_cache_groups(
+            self.shared_kv_cache_layers,
+            kv_cache_config.kv_cache_groups,
+            self.runner_only_attn_layers,
+        )
+
+        if self.cache_config.kv_sharing_fast_prefill:
+            # In You Only Cache Once (https://arxiv.org/abs/2405.05254) or other
+            # similar KV sharing setups, only the layers that generate KV caches
+            # are involved in the prefill phase, enabling prefill to early exit.
+            attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+            for layer_name in reversed(attn_layers):
+                if layer_name in self.shared_kv_cache_layers:
+                    self.kv_sharing_fast_prefill_eligible_layers.add(layer_name)
+                else:
+                    break
+
+    # NOTE(RBLN): Forked from upstream with RBLN-specific changes documented inline.
+    # TODO(RBLN): Sync with the current upstream version.
+    # TODO(RBLN): Comment for RBLN-specific parts.
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """
+        Initialize KV cache based on `kv_cache_config`.
+        Args:
+            kv_cache_config: Configuration for the KV cache, including the KV
+            cache size of each layer
+        """
+        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
+            len(kv_cache_config.kv_cache_groups) > 1
+        ):
+            raise NotImplementedError(
+                "Sub-block prefix caching does not support "
+                "multi-group KV caches yet.  "
+                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+            )
+
+        kv_cache_config = deepcopy(kv_cache_config)
+        self.kv_cache_config = kv_cache_config
+        self.may_add_encoder_only_layers_to_kv_cache_config()
+        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self.initialize_attn_backend(kv_cache_config)
+        # The kernel block size for all KV cache groups. For example, if
+        # kv_cache_manager uses block_size 256 for a given group,
+        # but the attention backends for that group only supports block_size 64,
+        # we will return kernel_block_size 64 and split the 256-token-block to
+        # 4 blocks with 64 tokens each.
+        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+        self.kernel_block_sizes = kernel_block_sizes
+
+        # create metadata builders
+        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        # Reinitialize need to after initialize_attn_backend
+        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        kv_caches = self.initialize_kv_cache_tensors(
+            kv_cache_config, kernel_block_sizes
+        )
+
+        if self.use_eagle():
+            assert isinstance(self.drafter, RBLNEagleProposer)
+            # validate all draft model layers belong to the same kv cache
+            # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        if has_kv_transfer_group():
+            kv_transfer_group = get_kv_transfer_group()
+            if self.cross_layers_kv_cache is not None:
+                assert self.cross_layers_attn_backend is not None
+                kv_transfer_group.register_cross_layers_kv_cache(
+                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
+                )
+            else:
+                kv_transfer_group.register_kv_caches(kv_caches)
+
+            def rbln_copy_kv_blocks(
+                src_kv_caches: dict[str, torch.Tensor],
+                dst_kv_caches: dict[str, torch.Tensor],
+                src_block_ids: list[int],
+                dst_block_ids: list[int],
+                direction: Literal["h2d", "d2h"],
+            ) -> None:
+                """Copy kv blocks between different buffers."""
+                if (
+                    not src_kv_caches
+                    or not dst_kv_caches
+                    or not src_block_ids
+                    or not dst_block_ids
+                ):
+                    return
+                assert src_block_ids == dst_block_ids, (
+                    "src_block_ids and dst_block_ids must be the same"
+                    f"src_block_ids: {src_block_ids}"
+                    f"dst_block_ids: {dst_block_ids}"
+                )
+                assert len(self.runtime_holder) > 0, "Runtime holder is not initialized"
+                runtime = self.runtime_holder[0]
+                if direction == "h2d":
+                    kv_caches = src_kv_caches
+                    copy_fn = runtime._update_kv_cache
+                else:
+                    kv_caches = dst_kv_caches
+                    copy_fn = runtime._fetch_kv_cache
+
+                for idx in src_block_ids:
+                    for kv_name, kv_cache in kv_caches.items():
+                        block_size = kv_cache.shape[-2]
+                        copy_fn(kv_cache, idx, 0, block_size, kv_name)
+
+            kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
+
+            if hasattr(kv_transfer_group, "set_runtime_holder"):
+                kv_transfer_group.set_runtime_holder(self.runtime_holder)
+
+        if self.dcp_world_size > 1:
+            layer_type = cast(type[Any], AttentionLayerBase)
+            layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+            for layer in layers.values():
+                layer_impl = getattr(layer, "impl", None)
+                if layer_impl is None:
+                    continue
+                assert layer_impl.need_to_return_lse_for_decode, (
+                    "DCP requires attention impls to return"
+                    " the softmax lse for decode, but the impl "
+                    f"{layer_impl.__class__.__name__} "
+                    "does not return the softmax lse for decode."
+                )
+
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.cache_config.num_cpu_blocks = 0
+
+    def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
+        """
+        Add encoder-only layers to the KV cache config.
+        """
+        block_size = self.vllm_config.cache_config.block_size
+        encoder_only_attn_specs: dict[AttentionSpec, list[str]] = defaultdict(list)
+        attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for layer_name, attn_module in attn_layers.items():
+            if attn_module.attn_type == AttentionType.ENCODER_ONLY:
+                attn_spec: AttentionSpec = EncoderOnlyAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=attn_module.num_kv_heads,
+                    head_size=attn_module.head_size,
+                    dtype=self.kv_cache_dtype,
+                )
+                encoder_only_attn_specs[attn_spec].append(layer_name)
+                self.runner_only_attn_layers.add(layer_name)
+        if len(encoder_only_attn_specs) > 0:
+            assert len(encoder_only_attn_specs) == 1, (
+                "Only support one encoder-only attention spec now"
+            )
+            spec, layer_names = encoder_only_attn_specs.popitem()
+            self.kv_cache_config.kv_cache_groups.append(
+                KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+            )
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """
+        Generates the KVCacheSpec by parsing the kv cache format from each
+        Attention module in the static forward context.
+        Returns:
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
+            format. Layers that do not need KV cache are not included.
+        """
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
+        layer_type = cast(type[Any], AttentionLayerBase)
+        attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+        for layer_name, attn_module in attn_layers.items():
+            if isinstance(attn_module, Attention) and (
+                kv_tgt_layer := attn_module.kv_sharing_target_layer_name
+            ):
+                # The layer doesn't need its own KV cache and will use that of
+                # the target layer. We skip creating a KVCacheSpec for it, so
+                # that KV cache management logic will act as this layer does
+                # not exist, and doesn't allocate KV cache for the layer. This
+                # enables the memory saving of cross-layer kv sharing, allowing
+                # a given amount of memory to accommodate longer context lengths
+                # or enable more requests to be processed simultaneously.
+                self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                continue
+            # Skip modules that don't need KV cache (eg encoder-only attention)
+            if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                kv_cache_spec[layer_name] = spec
+
+        return kv_cache_spec
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        # This is a short term mitigation for issue mentioned in
+        # https://github.com/vllm-project/vllm/issues/22754.
+        # `tolist` would trigger a cuda wise stream sync, which
+        # would block other copy ops from other cuda streams.
+        # A cuda event sync would avoid such a situation. Since
+        # this is in the critical path of every single model
+        # forward loop, this has caused perf issue for a disagg
+        # setup.
+        pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
+        pinned.copy_(sampled_token_ids, non_blocking=True)
+        # self.transfer_event.record()
+        # self.transfer_event.synchronize()
+        return pinned.tolist()
+
+    ###########################################################################
+    # RBLN-specific methods
+    ###########################################################################
+
+    def _enable_performance_tracker(self):
+        if envs.VLLM_RBLN_METRICS:
+            self.performance_tracker = PerformanceTracker("MODEL")
+            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
+            self.e2e_performance_tracker = PerformanceTracker("E2E")
+
+    def _compile_model(self, model):
+        TP = get_tp_group()
+        PP = get_pp_group()
+        DP = get_dp_group()
+
+        process_group_dict = {}
+        process_group_dict[TP.device_group.group_name] = TP.ranks
+        process_group_dict[TP.cpu_group.group_name] = TP.ranks
+        process_group_dict[PP.device_group.group_name] = PP.ranks
+        process_group_dict[PP.cpu_group.group_name] = PP.ranks
+        process_group_dict[DP.device_group.group_name] = DP.ranks
+        process_group_dict[DP.cpu_group.group_name] = DP.ranks
+
+        options = {
+            "compile_context": self.compile_context,
+            "tensor_parallel_size": envs.VLLM_RBLN_TP_SIZE,
+            "process_group_dict": process_group_dict,
+            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
+            "mode": "strict",
+            "_runtime_holder": self.runtime_holder,
+        }
+        if not envs.VLLM_DISABLE_COMPILE_CACHE:
+            logger.info(
+                "Once the model is compiled for the first time, "
+                "the cached compiled binary will be reused."
+            )
+            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
+
+        # compile compute_logits
+        # FIXME(jiwoo.park): method assignment for torch.compile
+        self.compute_logits = torch.compile(  # type: ignore[method-assign]
+            self.compute_logits,
+            backend="rbln",
+            options=copy(options),
+            dynamic=False,
+        )
+
+        compiled_model = torch.compile(
+            model,
+            backend="rbln",
+            options=copy(options),
+            dynamic=False,
+        )
+
+        return compiled_model
+
+    # NOTE(RBLN): Upstream GPU runner no longer has a standalone get_dp_padding helper.
+    # The same DP padding concept is now folded into batch execution helpers such as
+    # get_cudagraph_and_dp_padding() or _determine_batch_execution_and_padding().
+    # RBLN keeps this helper separate because DP padding also selects the static decode
+    # bucket and the padded token count required by RBLN forward context.
+    def get_dp_padding(
+        self,
+        num_tokens: int,
+        batch_bucket_size: int | None,
+        num_padded_tokens: int | None = None,
+        is_prefill: bool = False,
+    ) -> tuple[int | None, int | None, torch.Tensor | None]:
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+
+        if dp_size == 1:
+            assert num_padded_tokens is None, (
+                "num_padded_tokens should not be applied for non-DP case"
+            )
+            return batch_bucket_size, num_padded_tokens, None
+
+        if num_padded_tokens is not None:
+            assert self.specialized_moe_decode, (
+                "num_padded_tokens is only supported when "
+                "specialized MOE decode is enabled"
+            )
+            assert num_padded_tokens == self.max_num_batched_tokens, (
+                "num_padded_tokens should be equal to max_num_batched_tokens"
+            )
+            assert not is_prefill, (
+                "num_padded_tokens is only supported for decode stage"
+            )
+            num_tokens_across_dp_cpu = RBLNDPMetadata.num_tokens_across_dp(
+                num_tokens, dp_size, dp_rank
+            )
+            return (batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu)
+
+        num_tokens_across_dp_cpu, max_decode_tokens = (
+            RBLNDPMetadata.num_tokens_across_dp_with_max_decode_tokens(
+                num_tokens, dp_size, dp_rank, is_prefill
+            )
+        )
+
+        any_prefill = max_decode_tokens is None
+        if any_prefill or not self.specialized_moe_decode:
+            num_padded_tokens = self.max_num_batched_tokens
+        else:
+            assert max_decode_tokens is not None
+            batch_bucket_size = self.bucketing_manager.find_decode_batch_bucket(
+                max_decode_tokens
+            )
+            num_padded_tokens = batch_bucket_size
+
+        return batch_bucket_size, num_padded_tokens, num_tokens_across_dp_cpu
 
     def compute_logits(
         self,
@@ -2465,209 +4558,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 **model_kwargs,
             )
 
-    def _bookkeeping_sync(
-        self,
-        scheduler_output: "SchedulerOutput",
-        sampler_output: SamplerOutput,
-        logits: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> tuple[
-        dict[str, int],
-        LogprobsLists | None,
-        list[list[int]],
-        dict[str, LogprobsTensors | None],
-        list[str],
-        dict[str, int],
-        list[int],
-    ]:
-        num_nans_in_logits = {}
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            num_nans_in_logits = self._get_nans_in_logits(logits)
-
-        num_reqs = self.input_batch.num_reqs
-        discard_sampled_tokens_req_indices = np.nonzero(
-            self.discard_request_mask.np[:num_reqs]
-        )[0]
-        for i in discard_sampled_tokens_req_indices:
-            gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
-                gen.set_offset(gen.get_offset() - 4)
-
-        # Copy some objects so they don't get modified after returning.
-        # This is important when using async scheduling.
-        req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-
-        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
-        sampled_token_ids = sampler_output.sampled_token_ids
-        logprobs_tensors = sampler_output.logprobs_tensors
-        invalid_req_indices = []
-        logprobs_lists = None
-        if not self.use_async_scheduling:
-            # Get the valid generated tokens.
-            max_gen_len = sampled_token_ids.shape[-1]
-            if max_gen_len == 1:
-                # No spec decode tokens.
-                valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                # Mask out the sampled tokens that should not be sampled.
-                for i in discard_sampled_tokens_req_indices:
-                    valid_sampled_token_ids[int(i)].clear()
-
-                if logprobs_tensors is not None:
-                    logprobs_lists = logprobs_tensors.tolists()
-            else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids, logprobs_lists = (
-                    RBLNRejectionSampler.parse_output(
-                        sampled_token_ids,
-                        self.input_batch.vocab_size,
-                        discard_sampled_tokens_req_indices,
-                        logprobs_tensors=logprobs_tensors,
-                    )
-                )
-        else:
-            valid_sampled_token_ids = []
-            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-            invalid_req_indices_set = set(invalid_req_indices)
-
-            # Cache the sampled tokens on the GPU and avoid CPU sync.
-            # These will be copied into input_ids in the next step
-            # when preparing inputs.
-            # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            self.input_batch.prev_req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                if i not in invalid_req_indices_set
-            }
-
-        # Cache the sampled tokens in the model runner, so that the scheduler
-        # doesn't need to send them back.
-        # NOTE(woosuk): As an exception, when using PP, the scheduler sends
-        # the sampled tokens back, because there's no direct communication
-        # between the first-stage worker and the last-stage worker.
-        req_ids = self.input_batch.req_ids
-        for req_idx in range(num_sampled_tokens):
-            if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
-            else:
-                sampled_ids = valid_sampled_token_ids[req_idx]
-
-            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
-
-            if not sampled_ids:
-                continue
-
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + num_sampled_ids
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}"
-            )
-
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-
-            req_id = req_ids[req_idx]
-            req_state = self.requests[req_id]
-            req_state.output_token_ids.extend(sampled_ids)
-
-        # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
-        )
-
-        return (
-            num_nans_in_logits,
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        )
-
-    def _get_slot_mappings(
-        self,
-        num_tokens_padded: int,
-        num_reqs_padded: int,
-        num_tokens_unpadded: int,
-        ubatch_slices: "UBatchSlices | None" = None,
-    ) -> tuple[
-        dict[int, torch.Tensor] | None,
-        dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-    ]:
-        """
-        Build slot mappings in both formats needed by the system.
-
-        Args:
-            num_tokens_padded: Total number of tokens (padded)
-            num_reqs_padded: Total number of requests (padded)
-            num_tokens_unpadded: Actual number of tokens (unpadded)
-            ubatch_slices: Optional ubatch slicing info for DBO
-
-        Returns:
-            A tuple of:
-            - slot_mappings_by_gid: dict[int, torch.Tensor] for attention metadata
-            - slot_mappings_by_layer: dict[str, torch.Tensor] or list for ForwardContext
-        """
-        if not (
-            hasattr(self, "kv_cache_config")
-            and self.kv_cache_config is not None
-            and len(self.kv_cache_config.kv_cache_groups) > 0
-        ):
-            return None, None
-
-        def _get_slot_mapping(kv_cache_gid: int):
-            assert num_reqs_padded is not None and num_tokens_padded is not None
-            kv_cache_spec = self.kv_cache_config.kv_cache_groups[
-                kv_cache_gid
-            ].kv_cache_spec
-            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
-                slot_mapping = torch.zeros(
-                    (num_tokens_padded,),
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
-                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
-
-            # Fill unused with -1. Needed for reshape_and_cache in full cuda
-            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
-
-            return slot_mapping
-
-        slot_mappings_by_gid = {
-            gid: _get_slot_mapping(gid)
-            for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
-        }
-
-        slot_mappings_by_layer: dict[str, torch.Tensor] = {}
-        for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            slot_mapping = slot_mappings_by_gid[gid]
-            for layer_name in kv_cache_group.layer_names:
-                slot_mappings_by_layer[layer_name] = slot_mapping
-
-        if ubatch_slices is not None:
-            result: list[dict[str, torch.Tensor]] = []
-            for ubatch in ubatch_slices:
-                sliced_mappings: dict[str, torch.Tensor] = {}
-                for layer_name, slot_mapping in slot_mappings_by_layer.items():
-                    sliced_mappings[layer_name] = slot_mapping[ubatch.token_slice]
-                result.append(sliced_mappings)
-            return slot_mappings_by_gid, result
-
-        return slot_mappings_by_gid, slot_mappings_by_layer
-
     def _process_kv_cache_copy_ops(
         self,
         copy_ops: "list[KVCacheCopyOp]",
@@ -2682,904 +4572,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             runtime = self.runtime_holder[0]
             for op in copy_ops:
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-
-    @staticmethod
-    def maybe_get_kv_connector_output(
-        scheduler_output: "SchedulerOutput",
-        defer_finalize: bool = False,
-    ) -> AbstractContextManager[KVConnectorOutput | None]:
-        warm_up_phase = scheduler_output.kv_connector_metadata is None
-        return (
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, defer_finalize=defer_finalize
-            )
-            if has_kv_transfer_group() and not warm_up_phase
-            else nullcontext()
-        )
-
-    @torch.inference_mode()
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
-        num_padded_tokens: int | None = None,
-    ) -> Union[ModelRunnerOutput, IntermediateTensors, None]:
-        self.e2e_start_time = time.perf_counter()
-        if self.execute_model_state is not None:
-            raise RuntimeError(
-                "State error: sample_tokens() must be called "
-                "after execute_model() returns None."
-            )
-
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(
-                scheduler_output.preempted_req_ids
-            )
-
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("Preprocess"):
-            self._update_states(scheduler_output)
-
-            # Process sub-block KV cache copy operations before the forward
-            # pass so that partially cached blocks are populated.
-            if (
-                isinstance(scheduler_output, RBLNSchedulerOutput)
-                and scheduler_output.kv_cache_copy_ops
-            ):
-                self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
-
-            if not num_scheduled_tokens:
-                warm_up_phase = scheduler_output.kv_connector_metadata is None
-                if not has_kv_transfer_group() or warm_up_phase:
-                    # Return empty ModelRunnerOutput if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-            if self.cache_config.kv_sharing_fast_prefill:
-                assert not self.num_prompt_logprobs, (
-                    "--kv-sharing-fast-prefill produces incorrect logprobs for "
-                    "prompt tokens, tokens, please disable it when the requests"
-                    " need prompt logprobs"
-                )
-
-            num_reqs = self.input_batch.num_reqs
-            req_ids = self.input_batch.req_ids
-            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-            # max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-
-            # Prepare the decoder inputs.
-            (
-                attn_metadata,
-                logits_indices,
-                spec_decode_metadata,
-                num_scheduled_tokens_np,
-                spec_decode_common_attn_metadata,
-                max_query_len,
-                batch_bucket_size,
-                num_padded_tokens,
-                num_tokens_across_dp,
-            ) = self._prepare_inputs(
-                scheduler_output, num_scheduled_tokens_np, num_padded_tokens
-            )
-
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_unpadded,
-                num_reqs_padded=num_reqs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=None,
-            )
-
-            (
-                num_input_tokens,
-                input_ids,
-                inputs_embeds,
-                positions,
-                model_kwargs,
-            ) = self._preprocess(scheduler_output)
-
-        assert input_ids is not None
-        is_prefill_phase = self.is_prefill_phase()
-
-        # Padding length for speculative decoding by num_speculative_tokens
-        if scheduler_output.scheduled_spec_decode_tokens:
-            max_spec_decode_len = (
-                max(
-                    len(s)
-                    for s in scheduler_output.scheduled_spec_decode_tokens.values()
-                )
-                + 1
-            )
-            num_scheduled_tokens_per_req = torch.tensor(
-                [
-                    scheduler_output.num_scheduled_tokens[i]
-                    for i in self.input_batch.req_ids
-                ],
-                device=input_ids.device,
-                dtype=torch.int32,
-            )
-            input_ids = rbln_utils.pad_speculative_draft_tokens(
-                input_ids,
-                num_scheduled_tokens_per_req,
-                max_spec_decode_len,
-            )
-            positions = rbln_utils.pad_speculative_draft_tokens(
-                positions,
-                num_scheduled_tokens_per_req,
-                max_spec_decode_len,
-            )
-            # `logits_indices` are built for the original flattened
-            # [req0_tokens, req1_tokens, ...] layout. After per-request padding,
-            # flatten order changes to fixed-stride rows
-            # [req0(max_spec), req1(max_spec), ...], so remap indices.
-            num_scheduled_tokens_i64 = num_scheduled_tokens_per_req.to(torch.int64)
-            req_indices = torch.repeat_interleave(
-                torch.arange(num_reqs, device=logits_indices.device),
-                num_scheduled_tokens_i64,
-            )
-            token_offsets = (
-                torch.arange(num_input_tokens, device=logits_indices.device)
-                - num_scheduled_tokens_i64.cumsum(0)[req_indices]
-                + num_scheduled_tokens_i64[req_indices]
-            )
-            unpadded_to_padded = req_indices * max_spec_decode_len + token_offsets
-            logits_indices = unpadded_to_padded[logits_indices.to(torch.int64)]
-
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_padded_tokens,
-                additional_kwargs=self._get_kv_cache_forward_context_kwargs(),
-            ),
-            record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            self._attach_kv_cache_bindings(attn_metadata)
-
-            # FIXME(jiwoo.park) This is a temporary workaround;
-            # we must resolve the batch dimension.
-            input_ids = input_ids.view(num_reqs, -1).to(torch.long)
-            positions = positions.view(num_reqs, -1)
-
-            token_indices = None
-            if is_prefill_phase and not self.use_eagle():
-                # DO NOT include compute logits if lora_config is enabled
-                token_indices = logits_indices
-
-            if is_prefill_phase:
-                # prefill chunk padding
-                prefill_size = self.scheduler_config.max_num_batched_tokens
-                input_ids = rbln_utils.pad(input_ids, -1, prefill_size)
-                positions = rbln_utils.pad(positions, -1, prefill_size)
-            else:
-                # decode batch padding
-                input_ids = rbln_utils.pad(input_ids, 0, batch_bucket_size)
-                positions = rbln_utils.pad(positions, -2, batch_bucket_size)
-
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-
-            if self.lora_config is not None:
-                lora_ids = [
-                    self.requests[req_id].lora_request.lora_int_id
-                    if self.requests[req_id].lora_request is not None
-                    else 0
-                    for req_id in self.input_batch.req_ids
-                ]
-
-                lora_mask = create_lora_mask(
-                    input_ids,
-                    lora_ids,
-                    self.lora_manager._adapter_manager.lora_index_to_id,
-                    self.lora_config.max_loras,
-                    self.lora_config.max_lora_rank,
-                    self.lora_config.lora_dtype,
-                    self.device,
-                )
-                sampler_indices_padded = create_sampler_indices_padded(
-                    lora_ids,
-                    self.lora_manager._adapter_manager.lora_index_to_id,
-                    batch_bucket_size,
-                    is_prefill_phase,
-                    self.lora_config.max_loras,
-                    self.device,
-                )
-                LoRAMask.set_lora_mask(lora_mask)
-                LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
-
-            model_start_time = time.perf_counter()
-            with capture_ctx as reports:
-                model_output = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    selected_token_indices=token_indices,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            if self.performance_tracker is not None:
-                # Record performance metrics
-                model_end_time = time.perf_counter()
-                model_execution_time = model_end_time - model_start_time
-                host_time = None
-                device_time = None
-                ccl_time = None
-
-                if reports is not None and len(reports) > 0:
-                    host_time = reports[0].get("total_host", None)
-                    device_time = reports[0].get("total_device", None)
-                    ccl_time = reports[0].get("total_ccl", None)
-
-                if is_prefill_phase:
-                    self.performance_tracker.record_prefill(
-                        model_execution_time,
-                        num_scheduled_tokens,
-                        host_time=host_time,
-                        device_time=device_time,
-                        ccl_time=ccl_time,
-                        request_ids=self.input_batch.req_ids,
-                    )
-                else:
-                    padded_decode = (
-                        num_padded_tokens is not None
-                        and num_padded_tokens != batch_bucket_size
-                    )
-                    self.performance_tracker.record_decode(
-                        model_execution_time,
-                        num_scheduled_tokens,
-                        host_time=host_time,
-                        device_time=device_time,
-                        ccl_time=ccl_time,
-                        padded_decode=padded_decode,
-                        request_ids=self.input_batch.req_ids,
-                    )
-
-        with record_function_or_nullcontext("Postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states, logits = model_output  # type: ignore[misc]
-            else:
-                hidden_states, logits = model_output  # type: ignore[misc]
-                aux_hidden_states = None
-            sample_hidden_states = None
-
-            # Broadcast PP output for external_launcher (torchrun)
-            # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
-            # https://github.com/vllm-project/vllm/issues/18019
-            broadcast_pp_output = (
-                self.parallel_config.distributed_executor_backend == "external_launcher"
-                and len(get_pp_group().ranks) > 0
-            )
-            if not get_pp_group().is_last_rank:
-                # For mid-pipeline stages, return intermediate tensors
-                assert isinstance(hidden_states, IntermediateTensors)
-                if not broadcast_pp_output:
-                    hidden_states.kv_connector_output = kv_connector_output
-                    self.kv_connector_output = kv_connector_output
-                    return hidden_states
-                # NOTE - DO NOT all_gather_group for RBLN pp
-                get_pp_group().send_tensor_dict(hidden_states.tensors)
-                logits = None
-            else:
-                # for last-pipeline stages, return hidden states
-                if self.is_pooling_model:
-                    return self._pool(
-                        hidden_states.flatten(0, -2),
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
-                sample_hidden_states = hidden_states
-                if not self.use_wrapped_compute_logits():
-                    # DO NOT include compute logits
-
-                    # FIXME(jiwoo.park) This is a temporary workaround;
-                    # SHOULD resolve the batch dimension.
-                    hidden_states = hidden_states.flatten(0, -2)
-
-                    if is_prefill_phase:  # prefill
-                        sample_hidden_states = hidden_states[logits_indices]
-                        logits = self.compute_logits(sample_hidden_states)
-                    else:  # decode
-                        logits = self.compute_logits(hidden_states)
-                        logits = logits[logits_indices]
-                    if not envs.VLLM_RBLN_LOGITS_ALL_GATHER:
-                        logits = self.logits_processor._gather_logits(logits)
-                    logits = logits.view(-1, logits.size(-1))
-                else:
-                    selected_token_indices = logits_indices
-                    assert selected_token_indices.dim() == 1
-                    if is_prefill_phase:  # prefill
-                        assert selected_token_indices.size(0) == 1
-                        num_computed = self.input_batch.num_computed_tokens_cpu
-                        num_prompted = self.input_batch.num_prompt_tokens
-                        is_last_prefill = (
-                            num_computed + self.max_num_tokens
-                        ) >= num_prompted
-                        if not is_last_prefill[0]:  # noqa: SIM108
-                            # chunked prefill(#0~#N-1, intermediate)
-                            # token_indices = torch.tensor([max_num_seqs-1])
-                            # selected = torch.tensor([])
-                            logits = logits[:0]
-                        else:
-                            # chunked prefill(#N, final)
-                            # token_indices = torch.tensor([last_seq_idx-1])
-                            # selected_token_indices == token_indices
-                            logits = logits
-
-                        if self.use_eagle():
-                            hidden_states = hidden_states.flatten(0, -2)
-                            sample_hidden_states = hidden_states[logits_indices]
-                            logits = logits[logits_indices]
-                    else:  # decode
-                        # selected_token_indices is for valid decode tokens
-                        # token_indices == None, selected = torch.tensor([0])
-                        if self.speculative_config is None:
-                            logits = logits[:num_input_tokens]
-                        else:
-                            batch_indices = torch.arange(
-                                self.input_batch.num_reqs, device=self.device
-                            )
-                            sample_hidden_states = hidden_states[
-                                batch_indices,
-                                : self.speculative_config.num_speculative_tokens + 1,
-                            ]
-                            logits = logits[selected_token_indices]
-
-            if broadcast_pp_output:
-                model_output_broadcast_data = (
-                    {
-                        "logits": logits.contiguous(),
-                    }
-                    if logits is not None
-                    else {}
-                )
-                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
-                assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
-
-        self.execute_model_state = ExecuteModelState(
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            slot_mappings,
-        )
-        self.kv_connector_output = kv_connector_output
-        return None
-
-    @torch.inference_mode()
-    def sample_tokens(
-        self, grammar_output: "GrammarOutput | None"
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        if self.execute_model_state is None:
-            kv_connector_output = self.kv_connector_output
-            self.kv_connector_output = None
-            # receive sampled token ids from the last PP rank.
-            if self.use_async_scheduling and get_pp_group().world_size > 1:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
-
-            # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
-            if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
-
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return output
-
-        # Unpack ephemeral state.
-        (
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            slot_mappings,
-        ) = self.execute_model_state
-        # Clear ephemeral state.
-        self.execute_model_state = None
-
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None and logits.shape[0] > 0:
-            # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
-            # to be float32 dtype for CPU tensors
-            original_dtype = logits.dtype
-            logits = logits.to(torch.float32)
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
-            logits = logits.to(original_dtype)
-
-        with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
-
-        def propose_draft_token_ids(sampled_token_ids):
-            assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    slot_mappings,
-                )
-
-        spec_config = self.speculative_config
-        use_padded_batch_for_eagle = (
-            self.use_eagle() and not spec_config.disable_padded_drafter_batch
-        )
-        effective_drafter_max_model_len = self.max_model_len
-        if effective_drafter_max_model_len is None:
-            effective_drafter_max_model_len = self.model_config.max_model_len
-        if (
-            spec_config is not None
-            and spec_config.draft_model_config is not None
-            and spec_config.draft_model_config.max_model_len is not None
-        ):
-            effective_drafter_max_model_len = (
-                spec_config.draft_model_config.max_model_len
-            )
-        input_fits_in_drafter = spec_decode_common_attn_metadata and (
-            spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
-            <= effective_drafter_max_model_len
-        )
-        if use_padded_batch_for_eagle:
-            assert spec_config is not None
-            assert isinstance(self.drafter, RBLNEagleProposer)
-            sampled_token_ids = sampler_output.sampled_token_ids
-            if input_fits_in_drafter:
-                # EAGLE speculative decoding can use the GPU sampled tokens as
-                # inputs, and does not need to wait for bookkeeping to finish.
-                propose_draft_token_ids(sampled_token_ids)
-
-        with record_function_or_nullcontext("Bookkeep"):
-            # NOTE:
-            # is_prefill is changed after bookkeeping
-            # so we need to get it before bookkeeping,
-            # and pass it to performance tracker.
-            is_prefill_phase = self.is_prefill_phase()
-            (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_sync(
-                scheduler_output,
-                sampler_output,
-                logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
-            )
-
-        if (
-            self.speculative_config
-            and not use_padded_batch_for_eagle
-            and input_fits_in_drafter
-        ):
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
-            propose_draft_token_ids(valid_sampled_token_ids)
-
-        # Finalize KV connector (wait_for_save + clear metadata) after
-        # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
-        if spec_config is not None:
-            self.finalize_kv_connector()
-
-        # FIXME(jiwoo.park) EPLB is not supported in RBLN
-        # with record_function_or_nullcontext("EPLB"):
-        #     self.eplb_step()
-
-        # self.kv_connector_output may be modified during drafting
-        kv_connector_output = self.kv_connector_output
-        self.kv_connector_output = None
-
-        output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
-            num_nans_in_logits=num_nans_in_logits,
-        )
-
-        if self.e2e_performance_tracker is not None:
-            self.e2e_end_time = time.perf_counter()
-            collect_metrics(
-                self.e2e_performance_tracker,
-                is_prefill_phase,
-                start_time=self.e2e_start_time,
-                end_time=self.e2e_end_time,
-                reports=[],
-                token_count=scheduler_output.total_num_scheduled_tokens,
-            )
-
-        if not self.use_async_scheduling:
-            return output
-
-        return AsyncRBLNModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-        )
-
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        if self._draft_token_ids is None:
-            return None
-        req_ids = self.input_batch.req_ids
-        if isinstance(self._draft_token_ids, torch.Tensor):
-            draft_token_ids = self._draft_token_ids.tolist()
-        else:
-            draft_token_ids = self._draft_token_ids
-        self._draft_token_ids = None
-        return DraftTokenIds(req_ids, draft_token_ids)
-
-    def _copy_valid_sampled_token_count(
-        self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
-    ) -> None:
-        if self.valid_sampled_token_count_event is None:
-            return
-
-        default_stream = torch.cuda.current_stream()
-        # Initialize a new stream to overlap the copy operation with
-        # prepare_input of draft model.
-        with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
-            counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
-            self.valid_sampled_token_count_event.record()
-
-        self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
-
-    def _get_valid_sampled_token_count(self) -> list[int]:
-        # Wait until valid_sampled_tokens_count is copied to cpu,
-        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
-        sampled_count_event = self.valid_sampled_token_count_event
-        if sampled_count_event is None or prev_sampled_token_ids is None:
-            return []
-
-        counts_cpu = self.valid_sampled_token_count_cpu
-        assert counts_cpu is not None
-        sampled_count_event.synchronize()
-        return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
-
-    def propose_draft_token_ids(
-        self,
-        scheduler_output: "SchedulerOutput",
-        sampled_token_ids: torch.Tensor | list[list[int]],
-        sampling_metadata: SamplingMetadata,
-        hidden_states: torch.Tensor,
-        sample_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-        common_attn_metadata: CommonAttentionMetadata,
-        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-    ) -> list[list[int]] | torch.Tensor:
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        spec_config = self.speculative_config
-        assert spec_config is not None
-        if spec_config.method == "ngram":
-            assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, NgramProposer)
-            draft_token_ids = self.drafter.propose(
-                sampled_token_ids,
-                self.input_batch.num_tokens_no_spec,
-                self.input_batch.token_ids_cpu,
-                slot_mappings=slot_mappings,
-            )
-        elif spec_config.method == "suffix":
-            assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, SuffixDecodingProposer)
-            draft_token_ids = self.drafter.propose(self.input_batch, sampled_token_ids)
-        elif spec_config.method == "medusa":
-            assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, RBLNMedusaProposer)
-
-            if spec_decode_metadata is None:
-                # prefill: hidden states are already per-request
-                hidden_states = sample_hidden_states
-            else:
-                # decode with draft tokens:
-                # pick last accepted token's hidden state per request
-                batch_indices = torch.arange(
-                    sample_hidden_states.shape[0], device=sample_hidden_states.device
-                )
-                indices = torch.tensor(
-                    [len(t) - 1 for t in sampled_token_ids],
-                    device=sample_hidden_states.device,
-                    dtype=torch.long,
-                )
-                hidden_states = sample_hidden_states[batch_indices, indices]
-
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-            draft_token_ids = self.drafter.propose(
-                target_hidden_states=hidden_states,
-                sampling_metadata=sampling_metadata,
-            )
-        elif spec_config.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
-            assert spec_config.disable_padded_drafter_batch is not True, (
-                "This option is not supported in vllm-rbln."
-            )
-            assert isinstance(sampled_token_ids, torch.Tensor), (
-                "sampled_token_ids should be a torch.Tensor."
-            )
-
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
-            )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
-
-            target_hidden_states = hidden_states
-            num_rejected_tokens_gpu = None
-            if spec_decode_metadata is None:
-                token_indices_to_sample = None
-                # input_ids can be None for multimodal models.
-                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
-                target_positions = self._get_positions(num_scheduled_tokens)
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
-                    )
-            else:
-                (
-                    common_attn_metadata,
-                    token_indices_to_sample,
-                    num_rejected_tokens_gpu,
-                ) = self.drafter.prepare_inputs_padded(
-                    common_attn_metadata,
-                    spec_decode_metadata,
-                    valid_sampled_tokens_count,
-                )
-                total_num_tokens = common_attn_metadata.num_actual_tokens
-                # When padding the batch, token_indices is just a range
-                target_token_ids = self.input_ids.gpu[:total_num_tokens]
-                target_positions = self._get_positions(total_num_tokens)
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
-                    )
-
-            if self.supports_mm_inputs:
-                mm_embed_inputs = self._gather_mm_embeddings(
-                    scheduler_output,
-                    shift_computed_tokens=1,
-                )
-            else:
-                mm_embed_inputs = None
-
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
-
-        return draft_token_ids
-
-    def load_model(self) -> None:
-        logger.info("Starting to load model %s...", self.model_config.model)
-        model_loader = get_model_loader(self.load_config)
-        if not hasattr(self, "model"):
-            logger.info("Loading model from scratch...")
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
-        else:
-            logger.info("Model was already initialized. Loading weights inplace...")
-            model_loader.load_weights(self.model, model_config=self.model_config)
-
-        self.model = self.get_model().eval()
-        self.compute_logits_model = self.model
-        if self.model_config.is_multimodal_model and hasattr(
-            self.model.get_language_model(), "logits_processor"
-        ):
-            self.compute_logits_model = self.model.get_language_model()
-            self.logits_processor = self.model.get_language_model().logits_processor
-        elif hasattr(self.model, "logits_processor"):
-            self.logits_processor = self.model.logits_processor
-        else:
-            self.logits_processor = None
-
-        logger.info("load_model = %s", self.model)
-        logger.info(
-            "model_config.num_layers = %d",
-            self.model_config.get_num_layers(self.parallel_config),
-        )
-
-        def model_wrapper(
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            intermediate_tensors: IntermediateTensors | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            selected_token_indices: torch.Tensor | None = None,
-        ) -> (
-            tuple[Any, Any, Any]
-            | tuple[Any, Any]
-            | tuple[
-                Union[torch.Tensor, IntermediateTensors],
-                torch.Tensor | Any,
-                Any,
-                Any | None,
-            ]
-        ):
-            """
-            This wrapper function is designed to be compiled by torch.compile.
-            It handles the forward pass of the underlying model and, computes
-            the logits from the hidden states if necessary.
-            """
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
-
-            logits = None
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = model_output
-            else:
-                hidden_states = model_output
-
-            if (
-                get_pp_group().is_last_rank
-                and self.use_wrapped_compute_logits()
-                and not self.is_pooling_model
-                and self.logits_processor is not None
-            ):
-                # last rank create real model output
-                if selected_token_indices is not None:
-                    # aten::select -> adv_index -->
-                    #     contrib_dynamic_take (tensor -> scalar)
-                    # aten::index_select --> take -->
-                    #     contrib_dynamic_take (tensor -> scalar)
-                    hidden_states = hidden_states[:, selected_token_indices]
-                logits = self.compute_logits_model.compute_logits(hidden_states)
-                logits = logits.view(-1, logits.size(-1))
-
-            # non last rank create intermediate tensors, bypass it
-            if self.use_aux_hidden_state_outputs:
-                return hidden_states, aux_hidden_states, logits
-            return hidden_states, logits
-
-        if self.lora_config:
-            self.model = self.load_lora_model(
-                self.model,
-                self.vllm_config,
-                self.device,
-            )
-        if hasattr(self, "drafter"):
-            logger.info("Loading drafter model...")
-            self.drafter.load_model(self.model)
-        if self.use_aux_hidden_state_outputs:
-            if not supports_eagle3(self.get_model()):
-                raise RuntimeError(
-                    "Model does not support EAGLE3 interface but "
-                    "aux_hidden_state_outputs was requested"
-                )
-
-            aux_layers = self._get_eagle3_aux_layers_from_config()
-            if aux_layers:
-                logger.info(
-                    "Using auxiliary layers from speculative config: %s",
-                    aux_layers,
-                )
-            else:
-                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
-
-            self.model.set_aux_hidden_state_layers(aux_layers)
-
-        # FIXME - device specific communication buffer (CUDA)?
-        # disable communication buffer for RBLN (NYI)
-        # communication buffers for efficient communication
-        # TODO - RBLN communication buffer can be defined
-        # prepare_communication_buffer_for_model(self.model)
-
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
-            self.model_executable = model_wrapper
-        else:
-            # NOTE - refer to pytorch 2.5 release notes
-            # torch.compile regional compilation without recompilations
-            # To prevent nn.modules parameters to be model input, set false
-            # if this flag is set, nn.modules parameters are treated
-            # as model input
-            torch._dynamo.config.inline_inbuilt_nn_modules = False
-            torch._dynamo.config.cache_size_limit = 64
-            # RBLN compile context to mark static address for kv cache tensor
-            # if tensor is set to have static address,
-            # similar to RBLN kv cache binding
-
-            compiled_graph = self._compile_model(model_wrapper)
-            self.model_executable = compiled_graph
-
-        distributed_executor_backend = (
-            self.vllm_config.parallel_config.distributed_executor_backend
-        )
-        if distributed_executor_backend == "ray":
-            self._prepare_prefill_intermediate_tensors()
-            for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-                self._prepare_decode_intermediate_tensors(batch_bucket_size)
-        else:
-            with torch.inference_mode():
-                self._prepare_prefill_intermediate_tensors()
-                for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
-                    self._prepare_decode_intermediate_tensors(batch_bucket_size)
-
-    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
-        """Extract Eagle3 auxiliary layer indices from speculative config.
-
-        These indices specify which hidden states from the base model should
-        be used as auxiliary inputs for the Eagle3 drafter model during
-        speculative decoding.
-
-        Returns:
-            Tuple of layer indices if found in draft model config,
-            None otherwise.
-        """
-        if not (self.speculative_config and self.speculative_config.draft_model_config):
-            return None
-
-        hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
-
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
-        if layer_ids and isinstance(layer_ids, (list, tuple)):
-            return tuple(layer_ids)
-
-        return None
 
     def _prepare_prefill_intermediate_tensors(self) -> None:
         def _reshape(
@@ -3637,251 +4629,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             tensorizer_config=tensorizer_config,
             model_config=self.model_config,
         )
-
-    def _get_prompt_logprobs_dict(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: dict[str, int],
-    ) -> dict[str, LogprobsTensors | None]:
-        num_prompt_logprobs_dict = self.num_prompt_logprobs
-        if not num_prompt_logprobs_dict:
-            return {}
-
-        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-
-        # Since prompt logprobs are a rare feature, prioritize simple,
-        # maintainable loop over optimal performance.
-        completed_prefill_reqs = []
-        for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
-            num_tokens = num_scheduled_tokens.get(req_id)
-            if num_tokens is None:
-                # This can happen if the request was preempted in prefill stage.
-                continue
-
-            # Get metadata for this request.
-            request = self.requests[req_id]
-            num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
-
-            # Set up target LogprobsTensors object.
-            logprobs_tensors = in_progress_dict.get(req_id)
-            if not logprobs_tensors:
-                # Create empty logprobs CPU tensors for the entire prompt.
-                # If chunked, we'll copy in slice by slice.
-                logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
-                )
-                in_progress_dict[req_id] = logprobs_tensors
-
-            # Determine number of logits to retrieve.
-            start_idx = request.num_computed_tokens
-            start_tok = start_idx + 1
-            num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
-                # This is a chunk, more tokens remain.
-                # In the == case, there are no more prompt logprobs to produce
-                # but we want to defer returning them to the next step where we
-                # have new generated tokens to return.
-                num_logits = num_tokens
-            else:
-                # This is the last chunk of prompt tokens to return.
-                num_logits = num_remaining_tokens
-                completed_prefill_reqs.append(req_id)
-                prompt_logprobs_dict[req_id] = logprobs_tensors
-
-            if num_logits <= 0:
-                # This can happen for the final chunk if we prefilled exactly
-                # (num_prompt_tokens - 1) tokens for this request in the prior
-                # step. There are no more prompt logprobs to produce.
-                continue
-
-            # Get the logits corresponding to this req's prompt tokens.
-            # If this is a partial request (i.e. chunked prefill),
-            # then there is prompt logprob generated for each index.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
-
-        # Remove requests that have completed prefill from the batch
-        # num_prompt_logprobs_dict.
-        for req_id in completed_prefill_reqs:
-            del num_prompt_logprobs_dict[req_id]
-            del in_progress_dict[req_id]
-
-        # Must synchronize the non-blocking GPU->CPU transfers.
-        if prompt_logprobs_dict:
-            self._sync_device()
-
-        return prompt_logprobs_dict
-
-    @contextmanager
-    def maybe_randomize_inputs(self, input_ids: torch.Tensor):
-        """
-        Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
-        This is to help balance expert-selection
-         - during profile_run
-         - during DP rank dummy run
-        """
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
-        if not randomize_inputs:
-            yield
-        else:
-            import functools
-
-            @functools.cache
-            def rand_input_ids() -> torch.Tensor:
-                return torch.randint_like(
-                    self.input_ids.gpu,
-                    low=0,
-                    high=self.model_config.get_vocab_size(),
-                    dtype=input_ids.dtype,
-                )
-
-            logger.debug_once("Randomizing dummy data for DP Rank")
-            input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
-            yield
-            input_ids.fill_(0)
-
-    def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
-        """
-        Initialize the attention backends and attention metadata builders.
-        """
-        assert len(self.attn_groups) == 0, "Attention backends are already initialized"
-
-        class AttentionGroupKey(NamedTuple):
-            attn_backend: type[AttentionBackend]
-            kv_cache_spec: KVCacheSpec
-
-        def get_attn_backends_for_group(
-            kv_cache_group_spec: KVCacheGroupSpec,
-        ) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:
-            layer_type = cast(type[Any], AttentionLayerBase)
-            layers = get_layers_from_vllm_config(
-                self.vllm_config, layer_type, kv_cache_group_spec.layer_names
-            )
-            attn_backends = {}
-            attn_backend_layers = defaultdict(list)
-            # Dedupe based on full class name; this is a bit safer than
-            # using the class itself as the key because when we create dynamic
-            # attention backend subclasses (e.g. ChunkedLocalAttention) unless
-            # they are cached correctly, there will be different objects per
-            # layer.
-            for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
-
-                if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
-                    attn_backend = create_fast_prefill_custom_backend(
-                        "FastPrefill",
-                        attn_backend,  # type: ignore[arg-type]
-                    )
-
-                full_cls_name = attn_backend.full_cls_name()
-                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                key = (full_cls_name, layer_kv_cache_spec)
-                attn_backends[key] = AttentionGroupKey(
-                    attn_backend, layer_kv_cache_spec
-                )
-                attn_backend_layers[key].append(layer_name)
-            return (
-                {attn_backends[k]: v for k, v in attn_backend_layers.items()},
-                set(group_key.attn_backend for group_key in attn_backends.values()),
-            )
-
-        def create_attn_groups(
-            attn_backends_map: dict[AttentionGroupKey, list[str]],
-            kv_cache_group_id: int,
-        ) -> list[AttentionGroup]:
-            attn_groups: list[AttentionGroup] = []
-            for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
-                attn_group = AttentionGroup(
-                    attn_backend,
-                    layer_names,
-                    kv_cache_spec,
-                    kv_cache_group_id,
-                )
-
-                attn_groups.append(attn_group)
-            return attn_groups
-
-        attention_backend_maps = []
-        attention_backend_list = []
-        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
-            attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
-            attention_backend_maps.append(attn_backends[0])
-            attention_backend_list.append(attn_backends[1])
-
-        for i, attn_backend_map in enumerate(attention_backend_maps):
-            self.attn_groups.append(create_attn_groups(attn_backend_map, i))
-
-    def initialize_metadata_builders(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
-    ) -> None:
-        """
-        Create the metadata builders for all KV cache groups and attn groups.
-        """
-        for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
-            for attn_group in self.attn_groups[kv_cache_group_id]:
-                attn_group.create_metadata_builders(
-                    self.vllm_config,
-                    self.device,
-                    kernel_block_sizes[kv_cache_group_id]
-                    if kv_cache_group_id < len(kernel_block_sizes)
-                    else None,
-                    num_metadata_builders=1
-                    if not self.parallel_config.enable_dbo
-                    else 2,
-                )
-        # Calculate reorder batch threshold (if needed)
-        # Note (tdoublep): do this *after* constructing builders,
-        # because some of them change the threshold at init time.
-        self.calculate_reorder_batch_threshold()
-
-        # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
-        ):
-            assert isinstance(self.drafter, RBLNEagleProposer)  # | DraftModelProposer)
-            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
-
-    def calculate_reorder_batch_threshold(self) -> None:
-        """
-        Check that if any backends reorder batches; that the reordering
-        is compatible (e.g., decode threshold is the same)
-        """
-
-        # check that if any backends reorder batches; that the reordering
-        # is compatible (e.g., decode threshold is the same)
-        # TODO(jiwoo.park): We need to implement reorder batch threshold
-        pass
 
     @staticmethod
     def select_common_block_size(
@@ -3981,88 +4728,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             max_num_blocks.append(max_num_blocks_per_req)
         return block_sizes, max_num_blocks
 
-    def may_reinitialize_input_batch(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
-    ) -> None:
-        """
-        Re-initialize the input batch if the block sizes are different from
-        `[self.cache_config.block_size]`. This usually happens when there
-        are multiple KV cache groups.
-
-        Args:
-            kv_cache_config: The KV cache configuration.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-        """
-        max_model_len = max(self.max_model_len, self.max_encoder_len)
-        block_sizes, max_num_blocks = self._kv_block_sizes_and_max_num_blocks(
-            kv_cache_config, max_model_len
-        )
-
-        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
-            self.cache_config.block_size
-        ]:
-            assert self.offload_config.uva.cpu_offload_gb == 0, (
-                "Cannot re-initialize the input batch when CPU weight "
-                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
-                "for more details."
-            )
-            self.input_batch = InputBatch(
-                max_num_reqs=self.max_num_reqs,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                vocab_size=self.model_config.get_vocab_size(),
-                block_sizes=block_sizes,
-                kernel_block_sizes=kernel_block_sizes,
-                max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
-                logitsprocs=self.input_batch.logitsprocs,
-                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
-                is_pooling_model=self.is_pooling_model,
-                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            )
-
-    def _allocate_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig
-    ) -> dict[str, torch.Tensor]:
-        """
-        Initializes the KV cache buffer with the correct size. The buffer needs
-        to be reshaped to the desired shape before being used by the models.
-
-        Args:
-            kv_cache_config: The KV cache config
-        Returns:
-            dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = "cpu" if not envs.VLLM_RBLN_COMPILE_MODEL else "meta"
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
-
-        layer_names = set()
-        for group in kv_cache_config.kv_cache_groups:
-            for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
-                    continue
-                layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), (
-            "Some layers are not correctly initialized"
-        )
-        return kv_cache_raw_tensors
-
-    def _attn_group_iterator(self) -> Iterator[AttentionGroup]:
-        return itertools.chain.from_iterable(self.attn_groups)
-
-    def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
-        if not self.kv_cache_config.kv_cache_groups:
-            return
-        for attn_groups in self.attn_groups:
-            yield from attn_groups
-
     def _prepare_kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> list[int]:
         """
         Generate kernel_block_sizes that matches each block_size.
@@ -4107,125 +4772,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
                 )
         return kernel_block_sizes
-
-    def _reshape_kv_cache_tensors(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
-        kernel_block_sizes: list[int],
-    ) -> tuple[
-        dict[str, torch.Tensor],
-        dict[str, torch.Tensor],
-        dict[str, KVCacheViewInfo],
-    ]:
-        """
-        Reshape the KV cache tensors to the desired shape and dtype.
-
-        Args:
-            kv_cache_config: The KV cache config
-            kv_cache_raw_tensors: The KV cache buffer of each layer, with
-                correct size but uninitialized shape.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-        Returns:
-            Tuple of (kv_caches, kv_cache_base_tensors, kv_cache_view_infos):
-            - kv_caches: layer name -> reshaped+permuted KV cache tensor
-            - kv_cache_base_tensors: layer name -> typed base tensor (pre-permute)
-            - kv_cache_view_infos: layer name -> view transformation metadata
-        """
-        kv_caches: dict[str, torch.Tensor] = {}
-        kv_cache_base_tensors: dict[str, torch.Tensor] = {}
-        kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
-        has_attn, has_mamba = False, False
-        for group in self._kv_cache_spec_attn_group_iterator():
-            kv_cache_spec = group.kv_cache_spec
-            attn_backend = group.backend
-            if group.kv_cache_group_id == len(kernel_block_sizes):
-                # There may be a last group for layers without kv cache.
-                continue
-            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
-            for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
-                    continue
-                raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                if isinstance(kv_cache_spec, AttentionSpec):
-                    has_attn = True
-                    num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
-                    )
-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kernel_num_blocks,
-                        kernel_block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
-                    )
-                    dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    # The allocation respects the backend-defined stride order
-                    # to ensure the semantic remains consistent for each
-                    # backend. We first obtain the generic kv cache shape and
-                    # then permute it according to the stride order which could
-                    # result in a non-contiguous tensor.
-                    kv_cache_shape = tuple(
-                        kv_cache_shape[i] for i in kv_cache_stride_order
-                    )
-                    # Maintain original KV shape view.
-                    inv_order = [
-                        kv_cache_stride_order.index(i)
-                        for i in range(len(kv_cache_stride_order))
-                    ]
-                    # Keep the deduped base in a backend-native multidimensional
-                    # shape so export/Relay never sees a giant flat dimension.
-                    typed_base = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                    )
-                    kv_caches[layer_name] = typed_base.permute(*inv_order)
-                    kv_cache_base_tensors[layer_name] = typed_base
-                    kv_cache_view_infos[layer_name] = KVCacheViewInfo(
-                        view_shape=kv_cache_shape,
-                        permute_order=tuple(inv_order),
-                    )
-                elif isinstance(kv_cache_spec, MambaSpec):
-                    has_mamba = True
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
-                    state_tensors = []
-                    storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
-                        tensor = torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
-                            stride=target_stride,
-                            storage_offset=storage_offset_bytes // dtype_size,
-                        )
-                        state_tensors.append(tensor)
-                        storage_offset_bytes += stride[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
-                else:
-                    raise NotImplementedError
-
-        if has_attn and has_mamba:
-            self._update_hybrid_attention_mamba_layout(kv_caches)
-
-        return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
 
     def _build_uniform_kv_cache_view_infos(
         self,
@@ -4295,308 +4841,6 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
     ) -> dict[str, tuple[torch.Tensor, ...]]:
         return build_kv_cache_forward_context_kwargs(self.kv_cache_bases)
-
-    def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
-    ) -> dict[str, torch.Tensor]:
-        """
-        Initialize the memory buffer for KV cache.
-
-        Args:
-            kv_cache_config: The KV cache config
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-
-        Returns:
-            Dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
-
-        # Try creating KV caches optimized for kv-connector transfers
-        cache_dtype = self.cache_config.cache_dtype
-        kv_cache_bases_by_layer: dict[str, torch.Tensor]
-        kv_cache_view_infos: dict[str, KVCacheViewInfo]
-        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
-            kv_caches, cross_layers_kv_cache, attn_backend = (
-                self.allocate_uniform_kv_caches(
-                    kv_cache_config,
-                    self.attn_groups,
-                    cache_dtype,
-                    self.device,
-                    kernel_block_sizes,
-                )
-            )
-            self.cross_layers_kv_cache = cross_layers_kv_cache
-            self.cross_layers_attn_backend = attn_backend
-            kv_cache_bases_by_layer = {
-                layer_name: cross_layers_kv_cache for layer_name in kv_caches
-            }
-            kv_cache_view_infos = self._build_uniform_kv_cache_view_infos(
-                kv_cache_config,
-                cross_layers_kv_cache,
-                attn_backend,
-            )
-        else:
-            # Fallback to the general case
-            # Initialize the memory buffer for KV cache
-            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-
-            # Change the memory buffer to the desired shape
-            kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos = (
-                self._reshape_kv_cache_tensors(
-                    kv_cache_config,
-                    kv_cache_raw_tensors,
-                    kernel_block_sizes,
-                )
-            )
-
-        # Set up cross-layer KV cache sharing
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
-            logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
-            kv_caches[layer_name] = kv_caches[target_layer_name]
-            kv_cache_bases_by_layer[layer_name] = kv_cache_bases_by_layer[
-                target_layer_name
-            ]
-            if target_layer_name in kv_cache_view_infos:
-                kv_cache_view_infos[layer_name] = kv_cache_view_infos[target_layer_name]
-
-        validate_shared_attention_kv_cache_contiguity(
-            kv_caches,
-            kv_cache_bases_by_layer,
-            kv_cache_view_infos,
-        )
-
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        self.kv_cache_bases = []
-        self.kv_cache_view_infos = []
-        self._update_kv_cache_base_bindings(
-            kv_cache_bases_by_layer,
-            kv_cache_view_infos,
-            num_attn_module,
-        )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
-        if not self.model_config.enforce_eager and envs.VLLM_RBLN_COMPILE_MODEL:
-            kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
-            assert len(kv_cache_names) == len(self.kv_caches)
-            for kv_cache, name in zip(self.kv_caches, kv_cache_names):
-                self.compile_context.mark_static_address(kv_cache, name)
-
-        return kv_caches
-
-    def maybe_add_kv_sharing_layers_to_kv_cache_groups(
-        self, kv_cache_config: KVCacheConfig
-    ) -> None:
-        """
-        Add layers that reuse KV cache to KV cache group of its target layer.
-        Mapping of KV cache tensors happens in `initialize_kv_cache_tensors()`
-        """
-        if not self.shared_kv_cache_layers:
-            # No cross-layer KV sharing, return
-            return
-
-        add_kv_sharing_layers_to_kv_cache_groups(
-            self.shared_kv_cache_layers,
-            kv_cache_config.kv_cache_groups,
-            self.runner_only_attn_layers,
-        )
-
-        if self.cache_config.kv_sharing_fast_prefill:
-            # In You Only Cache Once (https://arxiv.org/abs/2405.05254) or other
-            # similar KV sharing setups, only the layers that generate KV caches
-            # are involved in the prefill phase, enabling prefill to early exit.
-            attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-            for layer_name in reversed(attn_layers):
-                if layer_name in self.shared_kv_cache_layers:
-                    self.kv_sharing_fast_prefill_eligible_layers.add(layer_name)
-                else:
-                    break
-
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        """
-        Initialize KV cache based on `kv_cache_config`.
-        Args:
-            kv_cache_config: Configuration for the KV cache, including the KV
-            cache size of each layer
-        """
-        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
-            len(kv_cache_config.kv_cache_groups) > 1
-        ):
-            raise NotImplementedError(
-                "Sub-block prefix caching does not support "
-                "multi-group KV caches yet.  "
-                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
-            )
-
-        kv_cache_config = deepcopy(kv_cache_config)
-        self.kv_cache_config = kv_cache_config
-        self.may_add_encoder_only_layers_to_kv_cache_config()
-        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        self.initialize_attn_backend(kv_cache_config)
-        # The kernel block size for all KV cache groups. For example, if
-        # kv_cache_manager uses block_size 256 for a given group,
-        # but the attention backends for that group only supports block_size 64,
-        # we will return kernel_block_size 64 and split the 256-token-block to
-        # 4 blocks with 64 tokens each.
-        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
-        self.kernel_block_sizes = kernel_block_sizes
-
-        # create metadata builders
-        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
-
-        # Reinitialize need to after initialize_attn_backend
-        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
-
-        if self.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
-            # validate all draft model layers belong to the same kv cache
-            # group
-            self.drafter.validate_same_kv_cache_group(kv_cache_config)
-
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                kv_transfer_group.register_kv_caches(kv_caches)
-
-            def rbln_copy_kv_blocks(
-                src_kv_caches: dict[str, torch.Tensor],
-                dst_kv_caches: dict[str, torch.Tensor],
-                src_block_ids: list[int],
-                dst_block_ids: list[int],
-                direction: Literal["h2d", "d2h"],
-            ) -> None:
-                """Copy kv blocks between different buffers."""
-                if (
-                    not src_kv_caches
-                    or not dst_kv_caches
-                    or not src_block_ids
-                    or not dst_block_ids
-                ):
-                    return
-                assert src_block_ids == dst_block_ids, (
-                    "src_block_ids and dst_block_ids must be the same"
-                    f"src_block_ids: {src_block_ids}"
-                    f"dst_block_ids: {dst_block_ids}"
-                )
-                assert len(self.runtime_holder) > 0, "Runtime holder is not initialized"
-                runtime = self.runtime_holder[0]
-                if direction == "h2d":
-                    kv_caches = src_kv_caches
-                    copy_fn = runtime._update_kv_cache
-                else:
-                    kv_caches = dst_kv_caches
-                    copy_fn = runtime._fetch_kv_cache
-
-                for idx in src_block_ids:
-                    for kv_name, kv_cache in kv_caches.items():
-                        block_size = kv_cache.shape[-2]
-                        copy_fn(kv_cache, idx, 0, block_size, kv_name)
-
-            kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
-
-            if hasattr(kv_transfer_group, "set_runtime_holder"):
-                kv_transfer_group.set_runtime_holder(self.runtime_holder)
-
-        if self.dcp_world_size > 1:
-            layer_type = cast(type[Any], AttentionLayerBase)
-            layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
-            for layer in layers.values():
-                layer_impl = getattr(layer, "impl", None)
-                if layer_impl is None:
-                    continue
-                assert layer_impl.need_to_return_lse_for_decode, (
-                    "DCP requires attention impls to return"
-                    " the softmax lse for decode, but the impl "
-                    f"{layer_impl.__class__.__name__} "
-                    "does not return the softmax lse for decode."
-                )
-
-        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
-        self.cache_config.num_cpu_blocks = 0
-
-    def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
-        """
-        Add encoder-only layers to the KV cache config.
-        """
-        block_size = self.vllm_config.cache_config.block_size
-        encoder_only_attn_specs: dict[AttentionSpec, list[str]] = defaultdict(list)
-        attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-        for layer_name, attn_module in attn_layers.items():
-            if attn_module.attn_type == AttentionType.ENCODER_ONLY:
-                attn_spec: AttentionSpec = EncoderOnlyAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=attn_module.num_kv_heads,
-                    head_size=attn_module.head_size,
-                    dtype=self.kv_cache_dtype,
-                )
-                encoder_only_attn_specs[attn_spec].append(layer_name)
-                self.runner_only_attn_layers.add(layer_name)
-        if len(encoder_only_attn_specs) > 0:
-            assert len(encoder_only_attn_specs) == 1, (
-                "Only support one encoder-only attention spec now"
-            )
-            spec, layer_names = encoder_only_attn_specs.popitem()
-            self.kv_cache_config.kv_cache_groups.append(
-                KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
-            )
-
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """
-        Generates the KVCacheSpec by parsing the kv cache format from each
-        Attention module in the static forward context.
-        Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache
-            format. Layers that do not need KV cache are not included.
-        """
-        kv_cache_spec: dict[str, KVCacheSpec] = {}
-        layer_type = cast(type[Any], AttentionLayerBase)
-        attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
-        for layer_name, attn_module in attn_layers.items():
-            if isinstance(attn_module, Attention) and (
-                kv_tgt_layer := attn_module.kv_sharing_target_layer_name
-            ):
-                # The layer doesn't need its own KV cache and will use that of
-                # the target layer. We skip creating a KVCacheSpec for it, so
-                # that KV cache management logic will act as this layer does
-                # not exist, and doesn't allocate KV cache for the layer. This
-                # enables the memory saving of cross-layer kv sharing, allowing
-                # a given amount of memory to accommodate longer context lengths
-                # or enable more requests to be processed simultaneously.
-                self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
-                continue
-            # Skip modules that don't need KV cache (eg encoder-only attention)
-            if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                kv_cache_spec[layer_name] = spec
-
-        return kv_cache_spec
-
-    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
-        # This is a short term mitigation for issue mentioned in
-        # https://github.com/vllm-project/vllm/issues/22754.
-        # `tolist` would trigger a cuda wise stream sync, which
-        # would block other copy ops from other cuda streams.
-        # A cuda event sync would avoid such a situation. Since
-        # this is in the critical path of every single model
-        # forward loop, this has caused perf issue for a disagg
-        # setup.
-        pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
-        pinned.copy_(sampled_token_ids, non_blocking=True)
-        # self.transfer_event.record()
-        # self.transfer_event.synchronize()
-        return pinned.tolist()
 
     def is_prefills(self) -> np.ndarray:
         return (
