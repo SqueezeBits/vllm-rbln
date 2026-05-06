@@ -615,6 +615,7 @@ class RBLNWorker(WorkerBase):
                 self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
+# NOTE(RBLN): Forked from upstream with RBLN-specific changes.
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
