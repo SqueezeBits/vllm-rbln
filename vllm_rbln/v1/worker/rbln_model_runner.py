@@ -130,8 +130,8 @@ import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.lora.inputs import LoRAInputs
-from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.lora.inputs import LoRAInputs, create_sampler_indices_padded
+from vllm_rbln.lora.mask import LoRAMask, create_lora_mask
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -4858,67 +4858,3 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return (
             self.speculative_config is not None and self.speculative_config.use_eagle()
         )
-
-
-def create_lora_mask(
-    input_ids: torch.Tensor,
-    lora_ids: list[int],
-    lora_index_to_id: list[int],
-    max_loras: int,
-    max_lora_rank: int,
-    lora_dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    lora_mask = torch.zeros(
-        input_ids.shape[0] * input_ids.shape[1],
-        max_loras * max_lora_rank,
-        dtype=lora_dtype,
-        device=device,
-    )
-    ones = torch.ones(
-        input_ids.shape[1], max_lora_rank, dtype=lora_dtype, device=device
-    )
-
-    for i in range(len(lora_ids)):
-        if lora_ids[i] == 0:
-            continue
-
-        lora_index = lora_index_to_id.index(lora_ids[i])
-        start_row = i * input_ids.shape[1]
-        start_col = lora_index * max_lora_rank
-        lora_mask[
-            start_row : start_row + input_ids.shape[1],
-            start_col : start_col + max_lora_rank,
-        ] = ones
-
-    return lora_mask
-
-
-def create_sampler_indices_padded(
-    lora_ids: list[int],
-    lora_index_to_id: list[int],
-    max_num_seqs: int,
-    is_prefill: bool,
-    max_loras: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if is_prefill:
-        assert len(lora_ids) == 1, "Only single LoRA is supported during prefill phase"
-
-    prompt_mapping: list[int] = [
-        lora_index_to_id.index(lora_ids[i])
-        if i < len(lora_ids) and lora_ids[i] > 0
-        else -1
-        for i in range(len(lora_ids) if is_prefill else max_num_seqs)
-    ]
-    sampler_indices_padded = torch.tensor(
-        prompt_mapping, dtype=torch.long, device=device
-    )
-    sampler_indices_padded = torch.where(
-        sampler_indices_padded == -1, max_loras, sampler_indices_padded
-    )
-    sampler_indices_padded = torch.arange(
-        0, len(sampler_indices_padded), dtype=torch.long, device=device
-    ) + (sampler_indices_padded * len(sampler_indices_padded))
-
-    return sampler_indices_padded

@@ -27,3 +27,37 @@ class LoRAMask:
     @classmethod
     def get_lora_mask(cls) -> torch.Tensor:
         return cls.lora_mask
+
+
+def create_lora_mask(
+    input_ids: torch.Tensor,
+    lora_ids: list[int],
+    lora_index_to_id: list[int],
+    max_loras: int,
+    max_lora_rank: int,
+    lora_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    lora_mask = torch.zeros(
+        input_ids.shape[0] * input_ids.shape[1],
+        max_loras * max_lora_rank,
+        dtype=lora_dtype,
+        device=device,
+    )
+    ones = torch.ones(
+        input_ids.shape[1], max_lora_rank, dtype=lora_dtype, device=device
+    )
+
+    for i in range(len(lora_ids)):
+        if lora_ids[i] == 0:
+            continue
+
+        lora_index = lora_index_to_id.index(lora_ids[i])
+        start_row = i * input_ids.shape[1]
+        start_col = lora_index * max_lora_rank
+        lora_mask[
+            start_row : start_row + input_ids.shape[1],
+            start_col : start_col + max_lora_rank,
+        ] = ones
+
+    return lora_mask
