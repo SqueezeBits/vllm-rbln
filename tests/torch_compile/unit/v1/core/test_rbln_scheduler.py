@@ -14,14 +14,7 @@
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
-from vllm_rbln.v1.core.rbln_scheduler_policy import (
-    get_decode_batch_cap,
-    get_running_schedule_start_index,
-    is_prefill_request,
-    remove_scheduled_running_reqs_for_prefill,
-    trim_scheduled_tokens_to_spec_decode_cap,
-    update_spec_decode_cap,
-)
+from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, _is_prefill_request
 
 from .utils import create_requests
 
@@ -33,80 +26,58 @@ def _request(num_computed_tokens: int, num_tokens: int):
 
 
 def test_is_prefill_request_until_last_prompt_token() -> None:
-    assert is_prefill_request(_request(num_computed_tokens=0, num_tokens=8))
-    assert is_prefill_request(_request(num_computed_tokens=6, num_tokens=8))
-    assert not is_prefill_request(_request(num_computed_tokens=7, num_tokens=8))
+    assert _is_prefill_request(_request(num_computed_tokens=0, num_tokens=8))
+    assert _is_prefill_request(_request(num_computed_tokens=6, num_tokens=8))
+    assert not _is_prefill_request(_request(num_computed_tokens=7, num_tokens=8))
 
 
 def test_running_schedule_starts_at_tail_prefill() -> None:
-    running = [
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.running = [
         _request(num_computed_tokens=7, num_tokens=8),
         _request(num_computed_tokens=3, num_tokens=8),
     ]
 
-    assert get_running_schedule_start_index(running) == 1
+    assert scheduler._get_running_schedule_start_index() == 1
 
 
 def test_running_schedule_starts_at_zero_without_tail_prefill() -> None:
-    running = [
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.running = [
         _request(num_computed_tokens=3, num_tokens=8),
         _request(num_computed_tokens=7, num_tokens=8),
     ]
 
-    assert get_running_schedule_start_index(running) == 0
-    assert get_running_schedule_start_index([]) == 0
-
-
-def test_decode_batch_cap_uses_pipeline_parallel_size() -> None:
-    assert (
-        get_decode_batch_cap(
-            max_num_running_reqs=32,
-            pipeline_parallel_size=4,
-        )
-        == 8
-    )
+    assert scheduler._get_running_schedule_start_index() == 0
+    scheduler.running = []
+    assert scheduler._get_running_schedule_start_index() == 0
 
 
 def test_prefill_request_does_not_update_spec_decode_cap() -> None:
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.block_size = 8
+    scheduler.max_model_len = 32
     request = _request(num_computed_tokens=6, num_tokens=8)
 
-    assert (
-        update_spec_decode_cap(
-            request=request,
-            current_cap=8,
-            block_size=8,
-            max_model_len=32,
-        )
-        == 8
-    )
+    assert scheduler._update_spec_decode_cap(request, current_cap=8) == 8
 
 
 def test_decode_request_updates_spec_decode_cap_to_block_boundary() -> None:
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.block_size = 8
+    scheduler.max_model_len = 32
     request = _request(num_computed_tokens=7, num_tokens=8)
 
-    assert (
-        update_spec_decode_cap(
-            request=request,
-            current_cap=8,
-            block_size=8,
-            max_model_len=32,
-        )
-        == 1
-    )
+    assert scheduler._update_spec_decode_cap(request, current_cap=8) == 1
 
 
 def test_decode_request_updates_spec_decode_cap_to_max_model_len() -> None:
+    scheduler = object.__new__(RBLNScheduler)
+    scheduler.block_size = 8
+    scheduler.max_model_len = 7
     request = _request(num_computed_tokens=5, num_tokens=6)
 
-    assert (
-        update_spec_decode_cap(
-            request=request,
-            current_cap=8,
-            block_size=8,
-            max_model_len=7,
-        )
-        == 2
-    )
+    assert scheduler._update_spec_decode_cap(request, current_cap=8) == 2
 
 
 def test_trim_scheduled_tokens_to_spec_decode_cap() -> None:
@@ -116,7 +87,7 @@ def test_trim_scheduled_tokens_to_spec_decode_cap() -> None:
     num_scheduled_tokens = {request.request_id: 5}
     scheduled_spec_decode_tokens = {request.request_id: [1, 2, 3, 4]}
 
-    reclaimed = trim_scheduled_tokens_to_spec_decode_cap(
+    reclaimed = RBLNScheduler._trim_scheduled_tokens_to_spec_decode_cap(
         scheduled_running_reqs=[request],
         num_scheduled_tokens=num_scheduled_tokens,
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
@@ -135,7 +106,7 @@ def test_trim_scheduled_tokens_removes_empty_spec_decode_tokens() -> None:
     num_scheduled_tokens = {request.request_id: 5}
     scheduled_spec_decode_tokens = {request.request_id: [1, 2, 3, 4]}
 
-    reclaimed = trim_scheduled_tokens_to_spec_decode_cap(
+    reclaimed = RBLNScheduler._trim_scheduled_tokens_to_spec_decode_cap(
         scheduled_running_reqs=[request],
         num_scheduled_tokens=num_scheduled_tokens,
         scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
@@ -167,7 +138,7 @@ def test_remove_scheduled_running_reqs_for_prefill() -> None:
         req_b.request_id: [0],
     }
 
-    remove_scheduled_running_reqs_for_prefill(
+    RBLNScheduler._remove_scheduled_running_reqs_for_prefill(
         scheduled_running_reqs=scheduled_running_reqs,
         req_to_new_blocks=req_to_new_blocks,
         num_scheduled_tokens=num_scheduled_tokens,
