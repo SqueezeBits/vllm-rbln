@@ -45,6 +45,10 @@ logger = init_logger(__name__)
 # https://github.com/RBLN-SW/vllm-rbln/commit/191b133, and
 # https://github.com/RBLN-SW/vllm-rbln/pull/524.
 
+# TODO(RBLN): Additional forward context for OOT was introduced from
+# https://github.com/vllm-project/vllm/pull/31674, and we might be able to
+# remove the RBLN-specific forward context and extend it in platform.py
+
 
 @dataclass
 class RBLNDPMetadata(DPMetadata):
