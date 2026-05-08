@@ -1399,7 +1399,21 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             )
             assert attn_metadata.cache_seq_lens is not None
             assert attn_metadata.cache_offsets is not None
-            if envs.VLLM_RBLN_COMPILE_MODEL:
+            is_kv_shared_layer = self.kv_sharing_target_layer_name is not None
+            if is_kv_shared_layer:
+                assert (
+                    envs.VLLM_RBLN_COMPILE_MODEL
+                    and envs.VLLM_RBLN_USE_CUSTOM_KERNEL
+                ), "Shared-KV sliding window attention requires the Triton kernel path."
+                sliding_window_attention_naive_prefill = getattr(
+                    torch.ops.rbln_triton_ops,
+                    "sliding_window_attention_naive_prefill_read_only",
+                )
+                sliding_window_attention_naive_decode = getattr(
+                    torch.ops.rbln_triton_ops,
+                    "sliding_window_attention_naive_decode_read_only",
+                )
+            elif envs.VLLM_RBLN_COMPILE_MODEL:
                 if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     sliding_window_attention_naive_prefill = (
                         torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill
@@ -1423,42 +1437,66 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 )
 
             if not attn_metadata.is_prefill:
-                decode_args = [
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata.cache_seq_lens.to(torch.int32)
-                    if self.is_batch_attention_opt and b_size > 1
-                    else attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
-                    self.scale,
-                    attn_metadata.local_block_tables,
-                    self.scale,  # dummy
-                ]
-                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    if self.is_batch_attention_opt and b_size > 1:
-                        decode_args.append(attn_metadata.swa_attn_masks)
-                    else:
-                        decode_args.append(None)
-                    decode_args.append(self.sinks)
+                if is_kv_shared_layer:
+                    decode_args = [
+                        query,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                else:
+                    decode_args = [
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens.to(torch.int32)
+                        if self.is_batch_attention_opt and b_size > 1
+                        else attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                    if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                        if self.is_batch_attention_opt and b_size > 1:
+                            decode_args.append(attn_metadata.swa_attn_masks)
+                        else:
+                            decode_args.append(None)
+                        decode_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_decode(  # noqa: E501
                     *decode_args,
                 )
             else:
-                prefill_args = [
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
-                    self.scale,
-                    attn_metadata.local_block_tables,
-                    self.scale,  # dummy
-                ]
-                if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-                    prefill_args.append(self.sinks)
+                if is_kv_shared_layer:
+                    prefill_args = [
+                        query,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                else:
+                    prefill_args = [
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.scale,  # dummy
+                    ]
+                    if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                        prefill_args.append(self.sinks)
                 attn_output = sliding_window_attention_naive_prefill(  # noqa: E501
                     *prefill_args
                 )
