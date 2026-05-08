@@ -368,6 +368,11 @@ class Gemma4Attention(nn.Module):
                 kv_shared_layer_index = (
                     len(prev_layers) - 1 - prev_layers[::-1].index(current_layer_type)
                 )
+                if ".layers." not in prefix:
+                    raise ValueError(
+                        "Unexpected prefix format for Gemma4Attention: "
+                        f"'{prefix}'. Expected to contain '.layers.'."
+                    )
                 prefix_before_layers = prefix.split(".layers.")[0]
                 kv_sharing_target_layer_name = (
                     f"{prefix_before_layers}.layers."
@@ -410,20 +415,24 @@ class Gemma4Attention(nn.Module):
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
 
+        k = k.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
+        if self.proj_head_dim != self.head_dim:
+            k = k[..., : self.head_dim]
+
+        v = v.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
+        if self.proj_head_dim != self.head_dim:
+            v = v[..., : self.head_dim]
+
         if not self.is_kv_shared_layer:
-            k = k.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
-            if self.proj_head_dim != self.head_dim:
-                k = k[..., : self.head_dim]
             k = self.k_norm(k)
             k = k.flatten(-2, -1)
             q, k = self.rotary_emb(positions, q, k)
 
-            v = v.unflatten(-1, (self.num_kv_heads, self.proj_head_dim))
-            if self.proj_head_dim != self.head_dim:
-                v = v[..., : self.head_dim]
             v = self.v_norm(v)
             v = v.flatten(-2, -1)
         else:
+            k = k.flatten(-2, -1)
+            v = v.flatten(-2, -1)
             q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
@@ -493,7 +502,16 @@ class Gemma4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        layer_intermediate_size = config.intermediate_size
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
+        is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        use_double_wide_mlp = (
+            getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
+        )
+        layer_intermediate_size = config.intermediate_size * (
+            2 if use_double_wide_mlp else 1
+        )
         self.mlp = Gemma4MLP(
             hidden_size=self.hidden_size,
             intermediate_size=layer_intermediate_size,
