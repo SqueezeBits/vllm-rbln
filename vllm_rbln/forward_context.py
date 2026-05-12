@@ -31,7 +31,7 @@ from vllm.forward_context import (
 )
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)

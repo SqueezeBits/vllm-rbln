@@ -25,7 +25,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)

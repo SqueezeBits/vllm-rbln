@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo

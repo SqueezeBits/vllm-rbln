@@ -60,7 +60,7 @@ from vllm.v1.outputs import (
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import WorkerBase
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (

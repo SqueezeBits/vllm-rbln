@@ -27,7 +27,7 @@ from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import (

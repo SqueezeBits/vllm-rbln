@@ -29,9 +29,8 @@ else:
 import rebel
 from torch._dynamo import register_backend
 from vllm.platforms import Platform, PlatformEnum
-from vllm.utils.torch_utils import _StreamPlaceholder
 
-import vllm_rbln.rbln_envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.configuration import (
     is_qwen3_pooling,
@@ -55,23 +54,38 @@ register_backend(name="bypass", compiler_fn=bypass_backend)
 
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
-
-    # TODO(jiwoo.park): GroupCoordinator uses the device_name
+    # TODO(RBLN): GroupCoordinator uses the device_name
     # when torch.device(device_name) is called.
-    # But we don't support the 'rbln'' device yet.
+    # But we don't support the 'rbln' device yet.
     # To support this, we must use PyTorch-RBLN
-    plugin_name: str = "rbln"
     device_name: str = "cpu"
     device_type: str = "cpu"
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
-    simple_compile_backend = "bypass"
     device_control_env_var: str = "RBLN_DEVICES"
-    current_stream = _StreamPlaceholder
+    simple_compile_backend = "bypass"
 
     @classmethod
     def import_kernels(cls) -> None:
         pass
+
+    @classmethod
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
+    ) -> str:
+        if selected_backend != AttentionBackendEnum.CUSTOM:
+            logger.info("Cannot use %s backend on RBLN.", selected_backend)
+        if attn_selector_config.use_mla:
+            raise NotImplementedError("MLA is not supported on RBLN.")
+        if attn_selector_config.use_sparse:
+            raise NotImplementedError("Sparse Attention is not supported on RBLN.")
+
+        logger.info("Using %s Backend", selected_backend)
+
+        return selected_backend.get_path()
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -82,22 +96,13 @@ class RblnPlatform(Platform):
     def inference_mode():
         return torch.no_grad()
 
-    @classmethod
-    def set_device(cls, device: torch.device) -> None:
-        """
-        Set the device for the current platform.
-        """
-        logger.warning("set_device is not supported on RBLN.")
-        pass
-
-    @classmethod
-    def is_pin_memory_available(cls):
-        logger.warning("Pin memory is not supported on RBLN.")
-        return False
-
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "vllm_rbln.distributed.rbln_communicator.RblnCommunicator"  # noqa
+    # @classmethod
+    # def set_device(cls, device: torch.device) -> None:
+    #     """
+    #     Set the device for the current platform.
+    #     """
+    #     logger.warning("set_device is not supported on RBLN.")
+    #     pass
 
     @classmethod
     def pre_register_and_update(
@@ -115,54 +120,20 @@ class RblnPlatform(Platform):
                 action.choices = None  # Override choices
 
     @classmethod
-    def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
-        scheduler_config = vllm_config.scheduler_config
-        if not scheduler_config.enable_chunked_prefill:
-            raise ValueError(
-                "RBLN does not officially support disabling chunked prefill. "
-                "Please don't disable chunked prefill by yourself."
-            )
-
-        parallel_config = vllm_config.parallel_config
-        use_model_parallel = (
-            parallel_config.tensor_parallel_size > 1
-            or parallel_config.pipeline_parallel_size > 1
-            or parallel_config.data_parallel_size > 1
-            or parallel_config.enable_expert_parallel
-        )
-        if use_model_parallel:
-            if envs.VLLM_RBLN_PROFILER:
-                raise RuntimeError(
-                    "RBLN_PROFILER is not supported when using vLLM model parallel "
-                    "(TP, DP, EP, or PP)."
-                )
-            os.environ["RBLN_CTX_STANDALONE"] = "1"
-            ccl_async_mode = os.environ.get("RBLN_FORCE_CCL_ASYNC")
-            # NOTE If users don't set RBLN_FORCE_CCL_ASYNC, we will set it to 1
-            # to enable async mode by default for better performance.
-            # However, if users explicitly set RBLN_FORCE_CCL_ASYNC to 0,
-            # we will respect their choice but print a warning message.
-            if ccl_async_mode is None:
-                os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
-            elif ccl_async_mode == "0":
-                logger.warning(
-                    "RBLN_FORCE_CCL_ASYNC is set to 0, "
-                    "which may cause performance degradation "
-                    "when using vLLM model parallel (TP, DP, EP, or PP)."
-                )
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if envs.VLLM_USE_V2_MODEL_RUNNER:
+            raise RuntimeError("V2 model runner is not supported for RBLN backend.")
+
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
         if scheduler_config.async_scheduling:
-            scheduler_config.async_scheduling = False
-            logger.warning("Async scheduler not supported on RBLN.")
+            raise NotImplementedError("Async scheduling is not supported on RBLN.")
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            cls.validate_and_setup_prerequisite(vllm_config)
+            cls._validate_and_setup_prerequisite(vllm_config)
+
             if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
                 logger.info("original model_config.dtype = %s", model_config.dtype)
                 if model_config.dtype == torch.bfloat16:
@@ -283,10 +254,6 @@ class RblnPlatform(Platform):
                 parallel_config.distributed_executor_backend,
             )
 
-        assert not envs.VLLM_USE_V2_MODEL_RUNNER, (
-            "v2 model runner is not supported for RBLN backend."
-        )
-
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             from vllm.config import CompilationMode
 
@@ -306,25 +273,50 @@ class RblnPlatform(Platform):
                 model_config.disable_cascade_attn = True
 
     @classmethod
-    def get_attn_backend_cls(
-        cls,
-        selected_backend: "AttentionBackendEnum",
-        attn_selector_config: "AttentionSelectorConfig",
-        num_heads: int | None = None,
-    ) -> str:
-        if selected_backend and selected_backend != AttentionBackendEnum.FLASH_ATTN:
-            logger.info("Cannot use %s backend on RBLN.", selected_backend)
-        if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on RBLN.")
-        if attn_selector_config.use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on RBLN.")
+    def is_pin_memory_available(cls):
+        logger.warning("Pin memory is not supported on RBLN.")
+        return False
 
-        attn_backend_cls = (
-            "vllm_rbln.v1.attention.backends.flash_attention.RBLNAttentionBackend"
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        return "vllm_rbln.distributed.rbln_communicator.RblnCommunicator"  # noqa
+
+    @classmethod
+    def _validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
+        scheduler_config = vllm_config.scheduler_config
+        if not scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "Disabling chunked prefill is not supported on RBLN. "
+                "Please enable chunked prefill by yourself."
+            )
+
+        parallel_config = vllm_config.parallel_config
+        use_model_parallel = (
+            parallel_config.tensor_parallel_size > 1
+            or parallel_config.pipeline_parallel_size > 1
+            or parallel_config.data_parallel_size > 1
+            or parallel_config.enable_expert_parallel
         )
-        logger.info("Using RBLN Attention Backend: %s", attn_backend_cls)
-
-        return attn_backend_cls
+        if use_model_parallel:
+            if envs.VLLM_RBLN_PROFILER:
+                raise RuntimeError(
+                    "RBLN_PROFILER is not supported when using vLLM model parallel "
+                    "(TP, DP, EP, or PP)."
+                )
+            os.environ["RBLN_CTX_STANDALONE"] = "1"
+            ccl_async_mode = os.environ.get("RBLN_FORCE_CCL_ASYNC")
+            # NOTE If users don't set RBLN_FORCE_CCL_ASYNC, we will set it to 1
+            # to enable async mode by default for better performance.
+            # However, if users explicitly set RBLN_FORCE_CCL_ASYNC to 0,
+            # we will respect their choice but print a warning message.
+            if ccl_async_mode is None:
+                os.environ["RBLN_FORCE_CCL_ASYNC"] = "1"
+            elif ccl_async_mode == "0":
+                logger.warning(
+                    "RBLN_FORCE_CCL_ASYNC is set to 0, "
+                    "which may cause performance degradation "
+                    "when using vLLM model parallel (TP, DP, EP, or PP)."
+                )
 
     @classmethod
     def _disable_prefix_caching(cls, vllm_config: VllmConfig, reason: str) -> None:
@@ -366,16 +358,16 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod
-    def support_hybrid_kv_cache(cls) -> bool:
-        return True
-
-    @classmethod
     def get_punica_wrapper(cls) -> str:
         return "vllm_rbln.lora.punica_wrapper.punica_rbln.PunicaWrapperRBLN"
 
     @classmethod
     def can_update_inplace(cls) -> bool:
         return False
+
+    @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        return True
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:

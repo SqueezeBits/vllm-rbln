@@ -21,7 +21,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     UnquantizedFusedMoEMethod,
 )
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)

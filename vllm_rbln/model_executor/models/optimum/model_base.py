@@ -25,7 +25,7 @@ from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneratio
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import optimum.rbln
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )

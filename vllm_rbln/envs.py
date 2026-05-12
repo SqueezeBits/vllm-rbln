@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_MOE_REDUCE_SCATTER: bool = False
+    VLLM_RBLN_PROFILER: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
 
 
@@ -279,6 +280,10 @@ def __getattr__(name: str):
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(environment_variables.keys())
 
 
 vllm_envs.update(environment_variables)

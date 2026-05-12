@@ -118,7 +118,7 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
 )
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger

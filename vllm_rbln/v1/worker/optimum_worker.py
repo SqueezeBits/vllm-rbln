@@ -36,7 +36,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.cache_blocks import sync_num_blocks
 from vllm_rbln.utils.optimum.rbln_params import get_rbln_params

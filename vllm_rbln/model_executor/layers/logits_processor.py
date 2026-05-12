@@ -21,7 +21,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 
 
 def logits_processor_get_logits(

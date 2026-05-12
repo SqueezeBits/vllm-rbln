@@ -22,7 +22,7 @@ from vllm.forward_context import set_forward_context
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 
 
 class RBLNMedusaProposer(MedusaProposer):
