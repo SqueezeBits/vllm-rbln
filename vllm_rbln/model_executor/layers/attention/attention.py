@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import vllm.model_executor.layers.attention.attention as vllm_attn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
@@ -30,20 +29,16 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
-# ---------------------------------------------------------------------------
-# Snapshots of upstream implementations (used by RBLN overrides)
-# ---------------------------------------------------------------------------
-_upstream_init = Attention.__init__
-_upstream_get_kv_cache_spec = Attention.get_kv_cache_spec
+attention_original_init = Attention.__init__
 
 
-def _rbln_attention_init(self, *args, **kwargs) -> None:
-    _upstream_init(self, *args, **kwargs)
+def patched_attention_init(self, *args, **kwargs) -> None:
+    attention_original_init(self, *args, **kwargs)
 
-    # NOTE(jiwoo.park) layer index is required to use external binding KV cache.
+    # NOTE(RBLN): Layer index is required to use external binding KV cache.
     self.layer_index = extract_layer_index(self.layer_name)
 
-    # NOTE(RBLN) - consider PP
+    # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     if model_config is not None:
@@ -71,7 +66,8 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
     return attn_metadata.kv_caches[layer_index]
 
 
-def _rbln_unified_attention(
+@maybe_transfer_kv_layer
+def patched_unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -90,7 +86,8 @@ def _rbln_unified_attention(
     return output
 
 
-def _rbln_unified_attention_with_output(
+@maybe_transfer_kv_layer
+def patched_unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -125,15 +122,16 @@ def _rbln_unified_attention_with_output(
     )
 
 
-def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Block size may get updated after model loading, refresh it
     block_size = vllm_config.cache_config.block_size
     # Should not be called for enc-dec or encoder-only attention.
     assert self.attn_type == AttentionType.DECODER
     if self.sliding_window is not None:
-        assert not vllm_config.model_config.use_mla, (
-            "MLA is not supported for slidingwindow"
-        )
+        if vllm_config.model_config.use_mla:
+            raise NotImplementedError(
+                "MLA is not supported with sliding window attention."
+            )
         return RBLNSlidingWindowSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
@@ -149,12 +147,3 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             head_size_v=self.head_size_v,
             dtype=self.kv_cache_torch_dtype,
         )
-
-
-vllm_attn.unified_attention = maybe_transfer_kv_layer(_rbln_unified_attention)
-vllm_attn.unified_attention_with_output = maybe_transfer_kv_layer(
-    _rbln_unified_attention_with_output
-)
-
-Attention.__init__ = _rbln_attention_init
-Attention.get_kv_cache_spec = _rbln_get_kv_cache_spec

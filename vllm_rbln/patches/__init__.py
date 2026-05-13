@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.model_executor.layers.attention import Attention
+# NOTE(RBLN): Runtime monkey-patches applied when the RBLN plugin is loaded.
 
-__all__ = ["Attention"]
+from vllm_rbln.patches.registry import (
+    PatchDescriptor,
+    apply_registered_patches,
+    register_patch,
+)
+
+from . import attention  # noqa: F401
+
+__all__ = (
+    "PatchDescriptor",
+    "apply_registered_patches",
+    "register_patch",
+)
