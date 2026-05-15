@@ -20,9 +20,12 @@ from vllm_rbln.patches.registry import (
     register_patch,
 )
 
+# ruff: noqa: F401
 from . import (
-    attention,  # noqa: F401
-    rotary_embedding,  # noqa: F401
+    attention,
+    models_utils,
+    rotary_embedding,
+    vocab_parallel_embedding,
 )
 
 __all__ = (

@@ -1,11 +1,11 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -34,8 +34,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 
-def __vocab_parallel_embedding__init__(
-    self,
+def patched_vocab_parallel_embedding_init(
+    self: VocabParallelEmbedding,
     num_embeddings: int,
     embedding_dim: int,
     params_dtype: torch.dtype | None = None,
@@ -46,7 +46,9 @@ def __vocab_parallel_embedding__init__(
 ):
     torch.nn.Module.__init__(self)
 
-    # Keep the input dimensions.
+    # NOTE(RBLN): RBLN keeps token embeddings replicated even when TP is enabled,
+    # while ParallelLMHead remains vocab-sharded per TP rank. This split layout
+    # avoids TP collectives in embedding lookup but still allows sharded logits.
     if isinstance(self, ParallelLMHead):
         tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -120,7 +122,10 @@ def __vocab_parallel_embedding__init__(
     )
 
 
-def __vocab_parallel_embedding_forward(self, input_):
+def patched_vocab_parallel_embedding_forward(
+    self: VocabParallelEmbedding,
+    input_: torch.Tensor,
+):
     if self.tp_size > 1:
         # Build the mask.
         masked_input, input_mask = get_masked_input_and_mask(
@@ -138,24 +143,27 @@ def __vocab_parallel_embedding_forward(self, input_):
     # Mask the output embedding.
     if self.tp_size > 1:
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
+        # NOTE(RBLN): Only sharded embeddings need TP reduction.
+        # Replicated token embeddings take the tp_size == 1 path
+        # and return the local lookup result directly.
         output = tensor_model_parallel_all_reduce(output_parallel)
     else:
         output = output_parallel
     return output
 
 
-def __parallel_lm_head_tie_weights(self, embed_tokens: VocabParallelEmbedding):
+def patched_parallel_lm_head_tie_weights(
+    self: ParallelLMHead, embed_tokens: VocabParallelEmbedding
+):
     """Tie the weights with word embeddings."""
     # GGUF quantized embed_tokens.
     if self.quant_config and self.quant_config.get_name() == "gguf":
         return embed_tokens
     else:
+        # NOTE(RBLN): In TP, embed_tokens is replicated but lm_head is vocab-sharded,
+        # so they cannot share the same Parameter object. The loader patch replays
+        # the tied embeddings weight through lm_head loading, where weight_loader
+        # selects the rank-local vocab shard.
         if self.tp_size < 2:
             self.weight = embed_tokens.weight
         return self
-
-
-VocabParallelEmbedding.__init__ = __vocab_parallel_embedding__init__
-VocabParallelEmbedding.forward = __vocab_parallel_embedding_forward
-ParallelLMHead.tie_weights = __parallel_lm_head_tie_weights

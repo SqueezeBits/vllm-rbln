@@ -303,7 +303,7 @@ def sliding_window_attention_naive_decode(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if envs.VLLM_RBLN_COMPILE_MODEL:
-        return torch.ops.rbln_custom_ops.sliding_window_attention_navie_decode(
+        return torch.ops.rbln_custom_ops.sliding_window_attention_naive_decode(
             q,
             k,
             v,
