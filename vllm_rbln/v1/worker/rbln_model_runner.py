@@ -82,7 +82,6 @@ from vllm.v1.worker.utils import (
     KVCacheSpec,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    prepare_kernel_block_sizes,
 )
 
 from vllm_rbln import envs
@@ -101,7 +100,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
-from vllm_rbln.v1.worker.utils import get_kv_cache_names
+from vllm_rbln.v1.worker.utils import get_kv_cache_names, prepare_kernel_block_sizes
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -600,7 +599,7 @@ class RBLNModelRunner:
         query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
         seq_lens_np = self.seq_lens.numpy()
-        seq_lens_np = (
+        seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
         seq_lens_np[num_reqs:].fill(0)
@@ -1784,6 +1783,15 @@ class RBLNModelRunner:
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
+        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
+            len(kv_cache_config.kv_cache_groups) > 1
+        ):
+            raise NotImplementedError(
+                "Sub-block prefix caching does not support "
+                "multi-group KV caches yet.  "
+                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+            )
+
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)

@@ -24,9 +24,18 @@ from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
-import vllm_rbln.envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 logger = init_logger(__name__)
 
@@ -528,3 +537,49 @@ def get_kv_cache_names(
         for layer_name in layer_names:
             kv_cache_names.append(layer_name)
     return kv_cache_names
+
+
+def prepare_kernel_block_sizes(
+    kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+) -> list[int]:
+    """
+    Generate kernel_block_sizes that matches each block_size.
+
+    For attention backends that support virtual block splitting,
+    use the supported block sizes from the backend.
+    For other backends (like Mamba), use the same block size (no splitting).
+
+    Args:
+        kv_cache_config: The KV cache configuration.
+        attn_groups: Attention groups indexed by KV cache group id.
+
+    Returns:
+        List of kernel block sizes for each cache group.
+    """
+    kernel_block_sizes = []
+    for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+        kv_cache_spec = kv_cache_group.kv_cache_spec
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            # All layers in the UniformTypeKVCacheSpecs have the same type,
+            # pick an arbitrary one to dispatch.
+            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+        if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+            continue
+        if isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+            kernel_block_sizes.append(kv_cache_spec.sliding_window)
+        elif isinstance(kv_cache_spec, AttentionSpec):
+            # This is an attention backend that supports virtual block splitting.
+            kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+            group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+            selected_kernel_size = select_common_block_size(
+                kv_manager_block_size, group_backends
+            )
+            kernel_block_sizes.append(selected_kernel_size)
+        elif isinstance(kv_cache_spec, MambaSpec):
+            # This is likely Mamba or other non-attention cache, no splitting.
+            kernel_block_sizes.append(kv_cache_spec.block_size)
+        else:
+            raise NotImplementedError(
+                f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
+            )
+    return kernel_block_sizes
