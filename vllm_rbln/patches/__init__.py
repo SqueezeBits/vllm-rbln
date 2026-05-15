@@ -20,7 +20,10 @@ from vllm_rbln.patches.registry import (
     register_patch,
 )
 
-from . import attention  # noqa: F401
+from . import (
+    attention,  # noqa: F401
+    rotary_embedding,  # noqa: F401
+)
 
 __all__ = (
     "PatchDescriptor",

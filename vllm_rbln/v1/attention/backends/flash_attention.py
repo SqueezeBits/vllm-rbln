@@ -54,7 +54,7 @@ from ..ops.sliding_window_attention_naive import (
 logger = init_logger(__name__)
 
 
-@register_backend(AttentionBackendEnum.CUSTOM, "RBLN_ATTN")
+@register_backend(AttentionBackendEnum.CUSTOM)
 class RBLNFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:

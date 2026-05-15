@@ -14,7 +14,7 @@
 
 import contextlib
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -76,7 +76,7 @@ class RblnPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
-        if selected_backend != AttentionBackendEnum.CUSTOM:
+        if selected_backend and selected_backend != AttentionBackendEnum.CUSTOM:
             logger.info("Cannot use %s backend on RBLN.", selected_backend)
         if attn_selector_config.use_mla:
             raise NotImplementedError("MLA is not supported on RBLN.")
@@ -122,14 +122,24 @@ class RblnPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         if envs.VLLM_USE_V2_MODEL_RUNNER:
-            raise RuntimeError("V2 model runner is not supported for RBLN backend.")
+            raise ValueError(
+                "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
+            )
 
+        attention_config = vllm_config.attention_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
+        if attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.CUSTOM
+
         if scheduler_config.async_scheduling:
-            raise NotImplementedError("Async scheduling is not supported on RBLN.")
+            logger.warning(
+                "Asynchronous scheduling is not supported on RBLN. "
+                "Setting async_scheduling to False."
+            )
+            scheduler_config.async_scheduling = False
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             cls._validate_and_setup_prerequisite(vllm_config)
@@ -267,8 +277,9 @@ class RblnPlatform(Platform):
                     vllm_config.compilation_config.custom_ops = []
 
             if not model_config.disable_cascade_attn:
-                logger.info(
-                    "The cascade attention is disabled because RBLN does not support it"
+                logger.warning(
+                    "Cascade attention is not supported on RBLN. "
+                    "Disabling cascade attention."
                 )
                 model_config.disable_cascade_attn = True
 
@@ -299,7 +310,7 @@ class RblnPlatform(Platform):
         )
         if use_model_parallel:
             if envs.VLLM_RBLN_PROFILER:
-                raise RuntimeError(
+                raise ValueError(
                     "RBLN_PROFILER is not supported when using vLLM model parallel "
                     "(TP, DP, EP, or PP)."
                 )
@@ -386,3 +397,14 @@ class RblnPlatform(Platform):
         into one core group list for nixl start_kv_load()
         """
         return []
+
+    @classmethod
+    def set_additional_forward_context(cls, *args, **kwargs) -> dict[str, Any]:
+        """
+        Set some additional forward context for the current platform if needs.
+        """
+        additional_kwargs: dict[str, Any] = {}
+        if "kv_cache_bases" in kwargs:
+            additional_kwargs["kv_cache_bases"] = kwargs["kv_cache_bases"]
+
+        return additional_kwargs

@@ -13,11 +13,10 @@
 # limitations under the License.
 """A RBLN worker class."""
 
-import copy
 import os
 import time
 from types import NoneType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numba
 import torch
@@ -44,17 +43,15 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
-    DraftTokenIds,
     ModelRunnerOutput,
 )
 from vllm.v1.utils import report_usage_stats
@@ -95,56 +92,30 @@ class RBLNWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        self.device = torch.device(current_platform.device_type)
-
-        self.local_world_size = (
-            self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES
-        )
 
         self._init_device_env()
 
-        # Buffers saved before sleep
-        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._rbln_host_threads_before_compile_ready = False
         self._rbln_cpu_affinity_applied = False
 
-        profiler_config = vllm_config.profiler_config
-        # Set up profiler if profiling is enabled
-        if profiler_config.torch_profiler_dir:
-            logger.info(
-                "Profiling enabled. Traces will be saved to: %s",
-                profiler_config.torch_profiler_dir,
-            )
-            logger.debug(
-                "Profiler config: record_shapes=%s,"
-                "profile_memory=%s,with_stack=%s,with_flops=%s,use_gzip=%s",
-                profiler_config.torch_profiler_record_shapes,
-                profiler_config.torch_profiler_with_memory,
-                profiler_config.torch_profiler_with_stack,
-                profiler_config.torch_profiler_with_flops,
-                profiler_config.torch_profiler_use_gzip,
-            )
-            self.profiler = TorchProfilerWrapper(
-                profiler_config,
-                worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
-                local_rank=self.local_rank,
-                activities=["CPU"],
-            )
-        else:
-            self.profiler = None
+        self.profiler: Any | None = None
+        self.profiler_config = vllm_config.profiler_config
+
+        if self.profiler_config.profiler not in ("torch", None):
+            raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.parallel_config.disable_custom_all_reduce = True
 
     def sleep(self, level: int = 1) -> None:
-        logger.warning("sleep mode is not supported on RBLN, ignore it.")
+        logger.warning("Sleep mode is not supported on RBLN, ignore it.")
         pass
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        logger.warning("sleep mode is not supported on RBLN, ignore it.")
+        logger.warning("Sleep mode is not supported on RBLN, ignore it.")
         pass
 
     def _init_device_env(self) -> None:
-        world_size = self.local_world_size
+        world_size = self.parallel_config.world_size
         env_var = current_platform.device_control_env_var
 
         rbln_tp_size = envs.VLLM_RBLN_TP_SIZE
@@ -183,7 +154,10 @@ class RBLNWorker(WorkerBase):
         if has_torch_rbln and rbln_tp_size > 1:
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(rbln_tp_size)
 
+    @instrument(span_name="Init device")
     def init_device(self) -> None:
+        self.device = torch.device(current_platform.device_type)
+
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -192,13 +166,13 @@ class RBLNWorker(WorkerBase):
             self.local_rank,
             current_platform.dist_backend,
         )
+
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config,
-            self.device,
+            self.vllm_config, self.device
         )
 
         if self.rank == 0:
@@ -374,6 +348,7 @@ class RBLNWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
 
@@ -390,6 +365,180 @@ class RBLNWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    @instrument(span_name="Warmup (NPU)")
+    def compile_or_warm_up_model(self) -> float:
+        # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
+        st = time.perf_counter()
+
+        # NOTE(RBLN): Thread policy + RBLN_NUM_THREADS must be set
+        # before compile/warm-up. CPU affinity is applied afterward.
+        self._ensure_rbln_host_threads_before_compile()
+
+        try:
+            if (
+                self.model_config.enforce_eager
+                or not envs.VLLM_RBLN_COMPILE_MODEL
+                or not envs.VLLM_RBLN_ENABLE_WARM_UP
+            ):
+                logger.info("Skipping compile_or_warm_up_model.")
+            else:
+                self.model_runner.warmup_model()
+
+        except BackendCompilerFailed as e:
+
+            def is_rbln_oom_error(exc: BaseException | None) -> bool:
+                if not isinstance(exc, RuntimeError):
+                    return False
+
+                return any(
+                    isinstance(arg, str)
+                    and (
+                        "SYS_ENOMEM: Out of memory" in arg
+                        or "SYS_EBUSY: Lack of device memory" in arg
+                    )
+                    for arg in exc.args
+                )
+
+            if is_rbln_oom_error(e.inner_exception):
+                raise RuntimeError(
+                    "Not enough memory for "
+                    f"{self.model_runner.kv_cache_config.num_blocks} "
+                    "blocks of KV cache. Try reducing the number of blocks "
+                    "by setting --num-gpu-blocks-override."
+                ) from e
+            raise
+        finally:
+            # NOTE(RBLN): Apply CPU affinity only after compile/warm-up.
+            self._ensure_rbln_cpu_affinity_after_warmup()
+
+        return time.perf_counter() - st
+
+    def get_model(self) -> nn.Module:
+        return self.model_runner.get_model()
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.model_runner.get_supported_tasks()
+
+    @torch.inference_mode()
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        return self.model_runner.sample_tokens(grammar_output)
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | None:
+        intermediate_tensors = None
+        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+
+        if forward_pass and not get_pp_group().is_first_rank:
+            # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict()
+            )
+
+        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if isinstance(output, ModelRunnerOutput | NoneType):
+            return output
+
+        assert isinstance(output, IntermediateTensors)
+        parallel_config = self.vllm_config.parallel_config
+        assert (
+            parallel_config.distributed_executor_backend != ("external_launcher")
+            and not get_pp_group().is_last_rank
+        )
+
+        # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
+        get_pp_group().send_tensor_dict(output.tensors)
+
+        return None
+
+    # def take_draft_token_ids(self) -> DraftTokenIds | None:
+    #     return self.model_runner.take_draft_token_ids()
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        # Check if profiling is enabled
+        if self.profiler_config is None or self.profiler_config.profiler is None:
+            raise RuntimeError(
+                "Profiling is not enabled. Please set --profiler-config to enable "
+                "profiling. Example: "
+                "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
+                "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
+            )
+
+        if is_start:
+            # Generate the trace name by combining prefix with comprehensive rank suffix
+            from vllm.distributed.utils import get_worker_rank_suffix
+
+            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+
+            # Build the full trace name
+            trace_name = (
+                f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+            )
+
+            # Create the profiler wrapper only on the first start call
+            if self.profiler is None:
+                profiler_type = self.profiler_config.profiler
+                if profiler_type == "torch":
+                    self.profiler = TorchProfilerWrapper(
+                        self.profiler_config,
+                        worker_name=trace_name,
+                        local_rank=self.local_rank,
+                        activities=["CPU"],
+                    )
+                    logger.debug(
+                        "Starting torch profiler with tarce name: %s", trace_name
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid proifler value of {self.profiler_config.profiler}."
+                    )
+
+            self.profiler.start()
+        else:
+            if self.profiler is None:
+                logger.warning("Profiler was not started, nothing to stop.")
+                return
+            self.profiler.stop()
+
+    def execute_dummy_batch(self) -> None:
+        raise NotImplementedError
+
+    # def add_lora(self, lora_request: LoRARequest) -> bool:
+    #     return self.model_runner.add_lora(lora_request)
+
+    # def remove_lora(self, lora_id: int) -> bool:
+    #     return self.model_runner.remove_lora(lora_id)
+
+    # def list_loras(self) -> set[int]:
+    #     return self.model_runner.list_loras()
+
+    # def pin_lora(self, lora_id: int) -> bool:
+    #     return self.model_runner.pin_lora(lora_id)
+
+    def check_health(self) -> None:
+        # worker will always be healthy as long as it's running.
+        return
+
+    def shutdown(self) -> None:
+        logger.info("v1 rbln_worker shutdown called")
+        # has_kv_transfer_group can be None during interpreter shutdown.
+        if ensure_kv_transfer_shutdown is not None:
+            ensure_kv_transfer_shutdown()
+        if self.profiler is not None:
+            self.profiler.shutdown()
+
+        # if envs.VLLM_RBLN_METRICS:
+        #     if self.model_runner.performance_tracker:
+        #         self.model_runner.performance_tracker.print_final_stats()
+        #     if self.model_runner.sampler_performance_tracker:
+        #         self.model_runner.sampler_performance_tracker.print_final_stats()
+        #     if self.model_runner.e2e_performance_tracker:
+        #         self.model_runner.e2e_performance_tracker.print_final_stats()
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
@@ -444,175 +593,6 @@ class RBLNWorker(WorkerBase):
             self.parallel_config,
         )
         self._rbln_cpu_affinity_applied = True
-
-    def compile_or_warm_up_model(self) -> float:
-        st = time.perf_counter()
-        if self.parallel_config.data_parallel_size > 1:
-            if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
-                max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
-                max_num_seqs = self.scheduler_config.max_num_seqs
-                # TODO: consider relaxing this constraint
-                assert max_num_batched_tokens % max_num_seqs == 0, (
-                    "max_num_batched_tokens must be divisible by max_num_seqs"
-                )
-            elif envs.VLLM_RBLN_DP_IMPL == "dummy_prefill":
-                raise ValueError(
-                    "dummy_prefill is not supported in v1 worker"
-                    "and will be deprecated in the future"
-                )
-            self.model_runner.prepare_dummy_run()
-
-        # Thread policy + RBLN_NUM_THREADS before compile/warm-up; affinity after.
-        self._ensure_rbln_host_threads_before_compile()
-
-        if (
-            self.model_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-            or not envs.VLLM_RBLN_ENABLE_WARM_UP
-        ):
-            logger.warning("skipping compile_or_warm_up_model")
-
-            self._ensure_rbln_cpu_affinity_after_warmup()
-            return time.perf_counter() - st
-        else:
-            try:
-                self.model_runner.warm_up_model()
-
-            except BackendCompilerFailed as e:
-
-                def is_oom(exc):
-                    if isinstance(exc, RuntimeError):
-                        for arg in exc.args:
-                            if isinstance(arg, str) and (
-                                "SYS_ENOMEM: Out of memory" in arg
-                                or "SYS_EBUSY: Lack of device memory" in arg
-                            ):
-                                return True
-                    return False
-
-                if is_oom(e.inner_exception):
-                    raise RuntimeError(
-                        "Not enough memory for "
-                        f"{self.model_runner.kv_cache_config.num_blocks} "
-                        "blocks of KV cache. Try reducing the number of blocks "
-                        "by setting --num-gpu-blocks-override."
-                    ) from e
-
-                raise
-
-        # After warm-up: apply CPU affinity only (threads already set pre-compile).
-        self._ensure_rbln_cpu_affinity_after_warmup()
-        self.model_runner._enable_performance_tracker()
-
-        return time.perf_counter() - st
-
-    def get_model(self) -> nn.Module:
-        return self.model_runner.get_model()
-
-    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
-        return self.model_runner.get_supported_tasks()
-
-    @torch.inference_mode()
-    def sample_tokens(
-        self, grammar_output: "GrammarOutput | None"
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
-
-    @torch.inference_mode()
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput | None:
-        intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        if forward_pass and not get_pp_group().is_first_rank:
-            # NOTE - DO NOT all_gather_group for RBLN pp
-            intermediate_tensors = IntermediateTensors(
-                get_pp_group().recv_tensor_dict()
-            )
-
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-        if isinstance(output, ModelRunnerOutput | NoneType):
-            return output
-
-        assert isinstance(output, IntermediateTensors)
-        parallel_config = self.vllm_config.parallel_config
-        assert (
-            parallel_config.distributed_executor_backend != ("external_launcher")
-            and not get_pp_group().is_last_rank
-        )
-
-        # NOTE - DO NOT all_gather_group for RBLN pp
-        get_pp_group().send_tensor_dict(output.tensors)
-        kv_connector_output = output.kv_connector_output
-        if not kv_connector_output:
-            return None
-
-        # In case of PP with kv transfer, we need to pass through the
-        # kv_connector_output
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        output.kv_connector_output = kv_connector_output
-        return output
-
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.model_runner.take_draft_token_ids()
-
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
-        if is_start:
-            self.profiler.start()
-        else:
-            self.profiler.stop()
-            # only print profiler results on rank 0
-            if self.local_rank == 0:
-                print(
-                    self.profiler.profiler.key_averages().table(
-                        sort_by="self_cpu_time_total"
-                    )
-                )
-
-    def execute_dummy_batch(self) -> None:
-        self._ensure_rbln_host_threads_before_compile()
-        self.model_runner.dummy_run()
-
-    def add_lora(self, lora_request: LoRARequest) -> bool:
-        return self.model_runner.add_lora(lora_request)
-
-    def remove_lora(self, lora_id: int) -> bool:
-        return self.model_runner.remove_lora(lora_id)
-
-    def list_loras(self) -> set[int]:
-        return self.model_runner.list_loras()
-
-    def pin_lora(self, lora_id: int) -> bool:
-        return self.model_runner.pin_lora(lora_id)
-
-    def check_health(self) -> None:
-        # worker will always be healthy as long as it's running.
-        return
-
-    def shutdown(self) -> None:
-        logger.info("v1 rbln_worker shutdown called")
-        # has_kv_transfer_group can be None during interpreter shutdown.
-        if ensure_kv_transfer_shutdown is not None:
-            ensure_kv_transfer_shutdown()
-        if self.profiler is not None:
-            self.profiler.shutdown()
-
-        if envs.VLLM_RBLN_METRICS:
-            if self.model_runner.performance_tracker:
-                self.model_runner.performance_tracker.print_final_stats()
-            if self.model_runner.sampler_performance_tracker:
-                self.model_runner.sampler_performance_tracker.print_final_stats()
-            if self.model_runner.e2e_performance_tracker:
-                self.model_runner.e2e_performance_tracker.print_final_stats()
 
 
 def init_worker_distributed_environment(

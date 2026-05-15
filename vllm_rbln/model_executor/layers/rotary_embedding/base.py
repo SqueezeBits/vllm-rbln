@@ -17,10 +17,10 @@ import torch
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 
-rope_original__init__ = RotaryEmbedding.__init__
+original_rope_init = RotaryEmbedding.__init__
 
 
-def rope__custom_init__(
+def patched_rope_init(
     self: RotaryEmbedding,
     head_size: int,
     rotary_dim: int,
@@ -28,8 +28,9 @@ def rope__custom_init__(
     base: float,
     is_neox_style: bool,
     dtype: torch.dtype,
+    init_cache: bool = True,
 ):
-    rope_original__init__(
+    original_rope_init(
         self,
         head_size,
         rotary_dim,
@@ -37,6 +38,7 @@ def rope__custom_init__(
         base,
         is_neox_style,
         dtype,
+        init_cache,
     )
 
     # For best compatibility with rbln, we use the rotate_half-style RoPE.
@@ -51,7 +53,7 @@ def rope__custom_init__(
     self.register_buffer("sin_cache", sin, persistent=False)
 
 
-def rope_forward_oot(
+def patched_rope_forward_oot(
     self: RotaryEmbedding,
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -114,7 +116,3 @@ def rope_forward_oot(
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
 
     return query, key
-
-
-RotaryEmbedding.__init__ = rope__custom_init__
-RotaryEmbedding.forward_oot = rope_forward_oot

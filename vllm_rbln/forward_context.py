@@ -20,18 +20,16 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import vllm.forward_context as vfc
-from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import (
-    BatchDescriptor,
     DPMetadata,
     batchsize_logging_interval,
     create_forward_context,
     override_forward_context,
     track_batchsize,
 )
-from vllm.v1.worker.ubatch_utils import UBatchSlices
+from vllm.platforms import current_platform
 
-import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -128,17 +126,14 @@ class RBLNDPMetadata(DPMetadata):
 
 
 @contextmanager
-def _set_forward_context(
+def set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     virtual_engine: int = 0,
     num_tokens: int | None = None,
     num_tokens_across_dp: torch.Tensor | None = None,
-    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: BatchDescriptor | None = None,
-    ubatch_slices: UBatchSlices | None = None,
     num_padded_tokens: int | None = None,
-    additional_kwargs: dict[str, Any] | None = None,
+    **kwargs,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -149,33 +144,26 @@ def _set_forward_context(
         vfc.forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
-    enable_dp = vllm_config.parallel_config.data_parallel_size > 1
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if (enable_dp or use_moe_tokens_mask) and (
-        attn_metadata is not None or num_tokens is not None
-    ):
-        dp_metadata = RBLNDPMetadata.make(
-            vllm_config.parallel_config,
-            num_tokens or 0,
-            num_tokens_across_dp,
-            num_padded_tokens,
-        )
+    # if (vllm_config.parallel_config.data_parallel_size > 1
+    # or envs.VLLM_RBLN_USE_MOE_TOKENS_MASK) and (
+    #     attn_metadata is not None or num_tokens is not None
+    # ):
+    #     dp_metadata = RBLNDPMetadata.make(
+    #         vllm_config.parallel_config,
+    #         num_tokens or 0,
+    #         num_tokens_across_dp,
+    #         num_padded_tokens,
+    #     )
+
+    additional_kwargs = current_platform.set_additional_forward_context(**kwargs)
 
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,
         virtual_engine,
         dp_metadata,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-        ubatch_slices,
+        additional_kwargs=additional_kwargs,
     )
-    if additional_kwargs:
-        existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)
-        if existing_additional_kwargs is None:
-            forward_context.additional_kwargs = dict(additional_kwargs)
-        else:
-            existing_additional_kwargs.update(additional_kwargs)
 
     try:
         with override_forward_context(forward_context):
@@ -183,14 +171,7 @@ def _set_forward_context(
     finally:
         if need_to_track_batchsize:
             batchsize = num_tokens
-            # we use synchronous scheduling right now,
-            # adding a sync point here should not affect
-            # scheduling of the next batch
-            from vllm.platforms import current_platform
 
-            synchronize = current_platform.synchronize
-            if synchronize is not None:
-                synchronize()
             now = time.perf_counter()
             # time measurement is in milliseconds
             vfc.batchsize_forward_time[batchsize].append(
@@ -215,6 +196,3 @@ def _set_forward_context(
                         ),
                         forward_stats,
                     )
-
-
-vfc.set_forward_context = _set_forward_context

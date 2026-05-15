@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# isort: off
 import inspect
+
+import rebel
 import torch
 import torch.nn as nn
 
@@ -23,16 +24,17 @@ try:
 except ImportError:
     has_torch_rbln = False
 
-from vllm_rbln.logger import init_logger
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler as VLLMSampler
-import rebel
 from vllm.config.model import LogprobsMode
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler as VLLMSampler
+
+import vllm_rbln.envs as envs
+from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.sample.ops.penalties import (
     apply_all_penalties as rbln_apply_all_penalties,
 )
-import vllm_rbln.envs as envs
 
 logger = init_logger(__name__)
 
@@ -175,7 +177,7 @@ class RBLNTopKTopPSampler(nn.Module):
             rbln_top_k_top_p_sample,
             dynamic=False,
             fullgraph=True,
-            backend="rbln",
+            backend=rbln_backend,
             options=options,
         )
         self.forward = self.forward_rbln
