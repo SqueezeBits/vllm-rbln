@@ -69,8 +69,6 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
 
-        if self.supports_mm_inputs:
-            raise NotImplementedError
         if self.needs_extra_input_slots:
             raise NotImplementedError(
                 "vllm-rbln does not support EAGLE extra input slots required for "
@@ -387,6 +385,10 @@ class RBLNEagleProposer(EagleProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        if self.supports_mm_inputs:
+            raise NotImplementedError(
+                "vllm-rbln does not pass multimodal embeddings to the drafter yet."
+            )
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
         if self.draft_id_to_target_id is not None:
