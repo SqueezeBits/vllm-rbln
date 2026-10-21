@@ -36,6 +36,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "Olmo2ForCausalLM": ("olmo2", "RBLNOlmo2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
+    "SmolLM3ForCausalLM": ("smollm3", "RBLNSmolLM3ForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
     "Starcoder2ForCausalLM": ("starcoder2", "RBLNStarcoder2ForCausalLM"),
     # Qwen3-Reranker is served by score() but reads its score off two vocabulary
