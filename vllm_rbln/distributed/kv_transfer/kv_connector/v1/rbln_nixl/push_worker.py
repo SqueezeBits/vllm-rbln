@@ -1079,25 +1079,24 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 "two block lists count different things."
             )
         local_block_ids, remote_block_ids, span, pieces = window
-        # Align the groups the way upstream aligns them before it reads them:
-        # a streamed batch empties the window's group on our side while the
-        # consumer keeps the block it registered for it, and the two lists
-        # have to name the same descriptors.
-        pairs = [
-            (loc[: len(rem)], rem[: len(loc)])
+        if not offered_tokens and not all(
+            len(loc) >= len(rem) and (len(rem) or not len(loc))
             for loc, rem in zip(local_block_ids, remote_block_ids)
-        ]
-        # The truncation above is what keeps the window's block off a streamed
-        # batch. On the handover it must drop nothing: a consumer that
-        # registered no block for a group would lose it here silently and then
-        # decode against a window nobody wrote.
-        assert offered_tokens or all(len(loc) == len(rem) for loc, rem in pairs), (
-            f"RBLN NIXL push: the handover of request {req_id} pairs block "
-            f"lists of lengths {[len(g) for g in local_block_ids]} against "
-            f"{[len(g) for g in remote_block_ids]}."
-        )
-        local_block_ids = tuple(loc for loc, _ in pairs)
-        remote_block_ids = tuple(rem for _, rem in pairs)
+        ):
+            raise RuntimeError(
+                f"RBLN NIXL push: the handover of request {req_id} pairs block "
+                f"lists of lengths {[len(g) for g in local_block_ids]} against "
+                f"{[len(g) for g in remote_block_ids]}."
+            )
+        # The consumer registers the suffix of each group, so the lists pair from
+        # the end: a streamed batch empties the window group on our side, and a
+        # handover may carry a leading null block the consumer never registered.
+        paired_local, paired_remote = [], []
+        for loc, rem in zip(local_block_ids, remote_block_ids):
+            n = min(len(loc), len(rem))
+            paired_local.append(loc[len(loc) - n :])
+            paired_remote.append(rem[len(rem) - n :])
+        local_block_ids, remote_block_ids = tuple(paired_local), tuple(paired_remote)
         notif_id = self._with_coverage(
             self._xfer_notif_id(
                 engine_id, meta.remote.request_id, remote_info.remote_tp_size
