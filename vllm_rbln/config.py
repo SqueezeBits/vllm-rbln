@@ -139,6 +139,16 @@ class RBLNConfig(RBLNConfigBase):
     """dtype the compiled graphs run in on the device. Empty keeps the
     compiler's per-target default."""
 
+    use_qk_hadamard: bool = False
+    """Rotate every query and key head by a Hadamard matrix right after RoPE.
+    Attention scores are unchanged in exact arithmetic; the KV cache stores the
+    rotated keys, which an fp8 KV cache quantizes with less error. Every engine
+    that shares the KV cache, such as both sides of a KV transfer, needs the
+    same setting."""
+
+    qk_hadamard_skip_layers: list[int] = field(default_factory=list)
+    """Decoder layer indices that `use_qk_hadamard` leaves unrotated."""
+
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
@@ -171,6 +181,8 @@ class RBLNConfig(RBLNConfigBase):
                 "decode_batch_bucket_strategy='manual' needs at least one entry "
                 "in decode_batch_bucket_manual_buckets"
             )
+        if self.qk_hadamard_skip_layers and not self.use_qk_hadamard:
+            raise ValueError("qk_hadamard_skip_layers needs use_qk_hadamard")
 
 
 @vllm_config_dataclass

@@ -2380,6 +2380,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
+        if self.rbln_config.use_qk_hadamard:
+            # Not at module level: vllm_rbln.patches imports this module.
+            from vllm_rbln.patches.rotary_embedding import rotate_qk_heads
+
+            rotate_qk_heads(
+                self.model, self.rbln_config.qk_hadamard_skip_layers, self.dtype
+            )
         self.supports_mm_inputs = self._resolve_mm_support()
 
         if hasattr(self.model, "logits_processor"):

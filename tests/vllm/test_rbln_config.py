@@ -193,6 +193,11 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
+def test_qk_hadamard_skip_layers_need_the_rotation():
+    with pytest.raises(ValueError, match="needs use_qk_hadamard"):
+        RBLNConfig(qk_hadamard_skip_layers=[0])
+
+
 @pytest.mark.parametrize("size", [0, -1])
 def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
     """`sub_block_size_in_use()` takes a size or None, so the field refuses
@@ -289,6 +294,10 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(sub_block_size=64).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(compile_dtype="float16").compute_hash() != base
+    rotated = RBLNConfig(use_qk_hadamard=True)
+    assert rotated.compute_hash() != base
+    skipped = RBLNConfig(use_qk_hadamard=True, qk_hadamard_skip_layers=[0])
+    assert skipped.compute_hash() != rotated.compute_hash()
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
