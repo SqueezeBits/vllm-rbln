@@ -465,6 +465,19 @@ class RBLNKVCacheManager(KVCacheManager):
 
         return match
 
+    def has_sub_block_match(self, request: Request, num_computed_tokens: int) -> bool:
+        """Whether `get_computed_blocks_sub_block` would find a match. Takes no
+        block reference, so nothing has to be applied or released."""
+        if (request.num_tokens - 1 - num_computed_tokens) < self.sub_block_size:
+            return False
+        sub_hashes = self._get_or_compute_sub_hashes(request).hashes
+        for gi in self._group_infos:
+            start = num_computed_tokens // gi.block_size * gi.sub_blocks_per_block
+            query = sub_hashes[start : start + gi.sub_blocks_per_block - 1]
+            if gi.sub_block_index.longest_match(query)[0] is None:
+                return False
+        return True
+
     def apply_sub_block_match(self, match: SubBlockMatch) -> None:
         """Create copy ops from a sub-block match.
 

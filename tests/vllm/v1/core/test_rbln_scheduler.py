@@ -1480,6 +1480,72 @@ class TestFcfsOrdering:
         assert admitted == ["A", "B", "C", "D"]
 
 
+@pytest.mark.usefixtures("cr13")
+class TestAdmitResidentPrefixFirst:
+    # "warm" runs first and leaves its prompt in the prefix cache; "hot" shares
+    # that prompt and arrives after cold requests that share nothing.
+    @staticmethod
+    def _queue(num_cold, *, sub_block_size=None, warm_len=33, hot_len=41):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            max_model_len=8192,
+            sub_block_size=sub_block_size,
+            additional_config={"admit_resident_prefix_first": True},
+        )
+        sched.add_request(
+            create_requests(1, num_tokens=warm_len, max_tokens=1, req_ids=["warm"])[0]
+        )
+        _drain(sched)
+        # create_requests fills request i's prompt with token i; drop index 0,
+        # which would share warm's prompt.
+        cold = create_requests(
+            num_cold + 1,
+            num_tokens=hot_len,
+            req_ids=[f"cold{i}" for i in range(num_cold + 1)],
+        )[1:]
+        hot = create_requests(1, num_tokens=hot_len, req_ids=["hot"])[0]
+        return sched, cold, hot
+
+    @staticmethod
+    def _first_admitted(sched, requests):
+        for r in requests:
+            sched.add_request(r)
+        return [nr.req_id for nr in sched.schedule().scheduled_new_reqs]
+
+    @pytest.mark.parametrize(
+        "sub_block_size,warm_len,hot_len",
+        [(None, 33, 41), (8, 12, 20)],
+        ids=["full-block-hit", "sub-block-hit"],
+    )
+    def test_resident_prefix_goes_ahead_of_earlier_misses(
+        self, sub_block_size, warm_len, hot_len
+    ):
+        sched, cold, hot = self._queue(
+            16, sub_block_size=sub_block_size, warm_len=warm_len, hot_len=hot_len
+        )
+        assert self._first_admitted(sched, [*cold, hot]) == ["hot"]
+
+    def test_short_queue_keeps_arrival_order(self):
+        sched, cold, hot = self._queue(14)
+        assert self._first_admitted(sched, [*cold, hot]) == ["cold1"]
+
+    def test_request_past_the_max_wait_keeps_its_place(self):
+        sched, cold, hot = self._queue(16)
+        cold[0].arrival_time -= 61
+        assert self._first_admitted(sched, [*cold, hot]) == ["cold1"]
+
+    @pytest.mark.parametrize(
+        "enable_prefix_caching,policy", [(False, "fcfs"), (True, "priority")]
+    )
+    def test_needs_prefix_caching_and_fcfs(self, enable_prefix_caching, policy):
+        with pytest.raises(ValueError, match="admit_resident_prefix_first"):
+            create_rbln_scheduler(
+                enable_prefix_caching=enable_prefix_caching,
+                policy=policy,
+                additional_config={"admit_resident_prefix_first": True},
+            )
+
+
 class TestPriorityScheduling:
     # RBLNScheduler.schedule() honors SchedulingPolicy.PRIORITY (lower priority
     # value = higher priority).

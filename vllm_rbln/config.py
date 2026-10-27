@@ -149,6 +149,13 @@ class RBLNConfig(RBLNConfigBase):
     qk_hadamard_skip_layers: list[int] = field(default_factory=list)
     """Decoder layer indices that `use_qk_hadamard` leaves unrotated."""
 
+    admit_resident_prefix_first: bool = False
+    """Once the waiting queue is deep, admit new requests whose prompt prefix
+    is still in the device KV cache ahead of the ones that would miss it. A
+    resident prefix is evicted while its request waits; a request with none
+    loses nothing by waiting. A request that has waited a minute keeps its
+    place. Needs prefix caching and the fcfs policy."""
+
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
@@ -160,10 +167,12 @@ class RBLNConfig(RBLNConfigBase):
 
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. Sub-block caching changes what runs, not what is built.
+            # the bundle. Sub-block caching and the admission order change what
+            # runs, not what is built.
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
+            "admit_resident_prefix_first",
         }
         factors = get_hash_factors(self, ignored_factors)
         # Unset and True build the same graph; only False changes the artifact.

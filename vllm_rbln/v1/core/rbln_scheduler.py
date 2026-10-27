@@ -54,6 +54,15 @@ from vllm_rbln.v1.core.utils import (
 
 logger = init_logger(__name__)
 
+# `admit_resident_prefix_first`: reorder while at least ON requests wait and
+# until no more than OFF do, look at most SCAN requests back, and never defer a
+# request that has waited MAX_WAIT_S. With a short queue every request is
+# admitted within a few steps, so its order costs no evictions.
+_RESIDENT_FIRST_ON = 16
+_RESIDENT_FIRST_OFF = 4
+_RESIDENT_FIRST_SCAN = 256
+_RESIDENT_FIRST_MAX_WAIT_S = 60.0
+
 
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
@@ -123,6 +132,17 @@ class RBLNScheduler(Scheduler):
         # lifecycle hooks clear its pending delta before it can resume with
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
+
+        self._admit_resident_prefix_first = rbln_config.admit_resident_prefix_first
+        if self._admit_resident_prefix_first and (
+            not self.cache_config.enable_prefix_caching
+            or self.policy != SchedulingPolicy.FCFS
+        ):
+            raise ValueError(
+                "admit_resident_prefix_first reorders the waiting queue by prefix "
+                "cache hits, so it needs prefix caching and the fcfs policy"
+            )
+        self._resident_first_active = False
 
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
@@ -452,6 +472,9 @@ class RBLNScheduler(Scheduler):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        if self._admit_resident_prefix_first:
+            self._admit_resident_prefixes_first()
 
         # Next, schedule the WAITING requests.
         # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
@@ -1041,6 +1064,53 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _admit_resident_prefixes_first(self) -> None:
+        """Reorder the head of `self.waiting` as [front, resident, rest], each
+        in arrival order. Front: anything but a new WAITING request, a request
+        that cannot look up the prefix cache, and one that has waited
+        `_RESIDENT_FIRST_MAX_WAIT_S`. Resident: a full-block or sub-block hit.
+
+        Without this, a deep queue admits in arrival order while admissions
+        evict the prefixes of the requests further back, so most of them land
+        on a miss and the queue stops draining.
+        """
+        num_waiting = len(self.waiting) + len(self.kv_holding_waiting)
+        if self._resident_first_active:
+            self._resident_first_active = num_waiting > _RESIDENT_FIRST_OFF
+        else:
+            self._resident_first_active = num_waiting >= _RESIDENT_FIRST_ON
+        if not self._resident_first_active:
+            return
+
+        kv_cache_manager = self.kv_cache_manager
+        now = time.time()
+        num_scanned = min(len(self.waiting), _RESIDENT_FIRST_SCAN)
+        front: list[Request] = []
+        resident: list[Request] = []
+        rest: list[Request] = []
+        for _ in range(num_scanned):
+            request = self.waiting.pop_request()
+            if (
+                request.status != RequestStatus.WAITING
+                or request.num_computed_tokens != 0
+                or not kv_cache_manager.prefix_cache_lookup_enabled(request)
+                or now - request.arrival_time > _RESIDENT_FIRST_MAX_WAIT_S
+            ):
+                front.append(request)
+                continue
+            _, num_hit_tokens, _ = kv_cache_manager.coordinator.find_longest_cache_hit(
+                request.block_hashes, request.num_tokens - 1
+            )
+            if num_hit_tokens or (
+                isinstance(kv_cache_manager, RBLNKVCacheManager)
+                and kv_cache_manager.has_sub_block_match(request, num_hit_tokens)
+            ):
+                resident.append(request)
+            else:
+                rest.append(request)
+        # FCFS prepend_requests puts its argument in front in reverse order.
+        self.waiting.prepend_requests(reversed(front + resident + rest))
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
